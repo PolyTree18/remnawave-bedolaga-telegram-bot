@@ -117,6 +117,8 @@ class TariffDetailResponse(BaseModel):
     external_squad_uuid: str | None = None
     # Показывать в подарках
     show_in_gift: bool = True
+    # Переопределение длительности триала для этого тарифа (None = глобальная настройка TRIAL_DURATION_DAYS)
+    trial_duration_days: int | None = None
     created_at: datetime
     updated_at: datetime | None = None
 
@@ -175,6 +177,8 @@ class TariffCreateRequest(BaseModel):
     external_squad_uuid: str | None = Field(None, pattern=UUID_PATTERN)
     # Показывать в подарках
     show_in_gift: bool = True
+    # Переопределение длительности триала для этого тарифа (None = глобальная настройка TRIAL_DURATION_DAYS)
+    trial_duration_days: int | None = Field(None, ge=1, description='Trial length override; None uses the global default')
 
 
 class TariffUpdateRequest(BaseModel):
@@ -216,6 +220,9 @@ class TariffUpdateRequest(BaseModel):
     external_squad_uuid: str | None = Field(None, pattern=UUID_PATTERN)
     # Показывать в подарках
     show_in_gift: bool | None = None
+    # Переопределение длительности триала для этого тарифа.
+    # Передать в теле для изменения; None или 0 = сброс к глобальной настройке TRIAL_DURATION_DAYS.
+    trial_duration_days: int | None = Field(None, ge=0)
 
 
 class TariffSortOrderRequest(BaseModel):

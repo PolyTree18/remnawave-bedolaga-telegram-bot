@@ -127,3 +127,59 @@ class ServerSyncRequest(BaseModel):
     """Request to sync servers."""
 
     force: bool = False  # Force sync even if recently synced
+
+
+class ServerDeleteRequest(BaseModel):
+    """Request body for deleting a server (destructive op needs explicit confirm)."""
+
+    confirm: bool = Field(False, description='Must be true to actually delete the server')
+
+
+class ServerDeleteResponse(BaseModel):
+    """Response after deleting a server."""
+
+    id: int
+    deleted: bool
+    message: str
+
+
+class ConnectedSubscriptionInfo(BaseModel):
+    """Per-subscription status for a user connected to the squad."""
+
+    id: int
+    status: str
+    status_display: str
+    is_active: bool
+    is_trial: bool
+    tariff_name: str | None = None
+    end_date: datetime | None = None
+
+
+class ConnectedUserItem(BaseModel):
+    """A user connected to the squad with their subscription statuses."""
+
+    id: int
+    telegram_id: int | None = None
+    username: str | None = None
+    full_name: str
+    subscriptions: list[ConnectedSubscriptionInfo]
+
+
+class ServerConnectedUsersResponse(BaseModel):
+    """Paginated list of users connected to a squad."""
+
+    server_id: int
+    squad_uuid: str
+    display_name: str
+    users: list[ConnectedUserItem]
+    total: int
+    page: int
+    limit: int
+    total_pages: int
+
+
+class ServerSyncCountersResponse(BaseModel):
+    """Response after recalculating server user counters."""
+
+    updated_servers: int
+    message: str
