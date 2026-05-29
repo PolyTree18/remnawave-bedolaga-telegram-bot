@@ -733,23 +733,30 @@ async def _send_template_offer_notifications(
 
         async with semaphore:
             try:
-                offer_record = await upsert_discount_offer(
-                    db,
-                    user_id=user.id,
-                    subscription_id=_resolve_offer_subscription_id(user),
-                    notification_type=f'promo_template_{template.id}',
-                    discount_percent=template.discount_percent,
-                    bonus_amount_kopeks=0,
-                    valid_hours=template.valid_hours,
-                    effect_type=effect_type,
-                    extra_data={
-                        'template_id': template.id,
-                        'offer_type': template.offer_type,
-                        'test_duration_hours': template.test_duration_hours,
-                        'test_squad_uuids': template.test_squad_uuids,
-                        'active_discount_hours': template.active_discount_hours,
-                    },
-                )
+                # Each concurrent send MUST use its own DB session — sharing the
+                # request-scoped `db` across coroutines gathered below corrupts
+                # the asyncpg connection ("another operation is in progress").
+                from app.database.database import AsyncSessionLocal
+
+                async with AsyncSessionLocal() as task_db:
+                    offer_record = await upsert_discount_offer(
+                        task_db,
+                        user_id=user.id,
+                        subscription_id=_resolve_offer_subscription_id(user),
+                        notification_type=f'promo_template_{template.id}',
+                        discount_percent=template.discount_percent,
+                        bonus_amount_kopeks=0,
+                        valid_hours=template.valid_hours,
+                        effect_type=effect_type,
+                        extra_data={
+                            'template_id': template.id,
+                            'offer_type': template.offer_type,
+                            'test_duration_hours': template.test_duration_hours,
+                            'test_squad_uuids': template.test_squad_uuids,
+                            'active_discount_hours': template.active_discount_hours,
+                        },
+                    )
+                    offer_record_id = offer_record.id
 
                 message_text = _render_template_text(
                     template,
@@ -761,7 +768,7 @@ async def _send_template_offer_notifications(
                         [
                             build_miniapp_or_callback_button(
                                 text=template.button_text,
-                                callback_data=f'claim_discount_{offer_record.id}',
+                                callback_data=f'claim_discount_{offer_record_id}',
                             )
                         ],
                         [

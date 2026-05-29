@@ -415,8 +415,13 @@ async def search_payments_endpoint(
     # Ensure custom dates are timezone-aware
     if date_from is not None and date_from.tzinfo is None:
         date_from = date_from.replace(tzinfo=UTC)
-    if date_to is not None and date_to.tzinfo is None:
-        date_to = date_to.replace(tzinfo=UTC)
+    if date_to is not None:
+        if date_to.tzinfo is None:
+            date_to = date_to.replace(tzinfo=UTC)
+        # The frontend <input type="date"> sends a bare date (midnight). Treat a
+        # midnight date_to as "include the whole end day" so the range is inclusive.
+        if (date_to.hour, date_to.minute, date_to.second, date_to.microsecond) == (0, 0, 0, 0):
+            date_to = date_to.replace(hour=23, minute=59, second=59, microsecond=999999)
 
     # Clamp custom dates to safety limit
     min_allowed = datetime.now(UTC) - timedelta(days=MAX_ALL_TIME_DAYS)
@@ -483,8 +488,13 @@ async def search_payments_stats_endpoint(
     # Ensure custom dates are timezone-aware
     if date_from is not None and date_from.tzinfo is None:
         date_from = date_from.replace(tzinfo=UTC)
-    if date_to is not None and date_to.tzinfo is None:
-        date_to = date_to.replace(tzinfo=UTC)
+    if date_to is not None:
+        if date_to.tzinfo is None:
+            date_to = date_to.replace(tzinfo=UTC)
+        # The frontend <input type="date"> sends a bare date (midnight). Treat a
+        # midnight date_to as "include the whole end day" so the range is inclusive.
+        if (date_to.hour, date_to.minute, date_to.second, date_to.microsecond) == (0, 0, 0, 0):
+            date_to = date_to.replace(hour=23, minute=59, second=59, microsecond=999999)
 
     # Clamp custom dates to safety limit
     min_allowed = datetime.now(UTC) - timedelta(days=MAX_ALL_TIME_DAYS)

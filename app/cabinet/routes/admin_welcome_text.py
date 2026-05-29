@@ -368,7 +368,7 @@ async def preview_welcome_text(
     """
     try:
         first_name = (request.first_name if request else None) or _PREVIEW_FIRST_NAME
-        username = request.username if request else _PREVIEW_USERNAME
+        username = (request.username if request else None) or _PREVIEW_USERNAME
 
         settings = await get_current_welcome_text_settings(db)
         is_enabled = settings['is_enabled']

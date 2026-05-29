@@ -52,7 +52,7 @@ async def _get_tariff_servers(
     db: AsyncSession, allowed_squads: list[str], server_traffic_limits: dict = None
 ) -> list[ServerInfo]:
     """Get server info for tariff."""
-    servers, _ = await get_all_server_squads(db, available_only=False)
+    servers, _ = await get_all_server_squads(db, available_only=False, limit=10000)
     limits = server_traffic_limits or {}
     result = []
     for server in servers:
@@ -152,7 +152,7 @@ async def get_available_servers(
     db: AsyncSession = Depends(get_cabinet_db),
 ):
     """Get list of all servers for tariff selection."""
-    servers, _ = await get_all_server_squads(db, available_only=False)
+    servers, _ = await get_all_server_squads(db, available_only=False, limit=10000)
     return [
         ServerInfo(
             id=server.id,

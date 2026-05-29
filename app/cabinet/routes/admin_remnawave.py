@@ -139,7 +139,7 @@ def _serialize_node(node_data: dict[str, Any]) -> NodeInfo:
         is_traffic_tracking_active=bool(node_data.get('is_traffic_tracking_active', False)),
         traffic_reset_day=node_data.get('traffic_reset_day'),
         notify_percent=node_data.get('notify_percent'),
-        consumption_multiplier=float(node_data.get('consumption_multiplier', 1.0)),
+        consumption_multiplier=float(node_data.get('consumption_multiplier') or 1.0),
         created_at=_parse_datetime(node_data.get('created_at')),
         updated_at=_parse_datetime(node_data.get('updated_at')),
         provider_uuid=node_data.get('provider_uuid'),
