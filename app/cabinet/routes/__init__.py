@@ -7,16 +7,23 @@ from app.cabinet.apple_iap import apple_iap_only_router, router as apple_iap_rou
 from .account_linking import merge_router as merge_router, router as account_linking_router
 from .admin_apps import router as admin_apps_router
 from .admin_audit_log import router as admin_audit_log_router
+from .admin_backup import router as admin_backup_router
 from .admin_ban_system import router as admin_ban_system_router
+from .admin_blacklist import router as admin_blacklist_router
 from .admin_broadcasts import router as admin_broadcasts_router
 from .admin_bulk_actions import router as admin_bulk_actions_router
 from .admin_button_styles import router as admin_button_styles_router
 from .admin_campaigns import router as admin_campaigns_router
 from .admin_channels import router as admin_channels_router
+from .admin_contests import router as admin_contests_router
 from .admin_email_templates import router as admin_email_templates_router
+from .admin_faq import router as admin_faq_router
 from .admin_info_pages import router as admin_info_pages_router
 from .admin_landings import router as admin_landings_router
+from .admin_legal_documents import router as admin_legal_documents_router
+from .admin_maintenance import router as admin_maintenance_router
 from .admin_menu_layout import router as admin_menu_layout_router
+from .admin_monitoring import router as admin_monitoring_router
 from .admin_news import router as admin_news_router
 from .admin_news_categories import router as admin_news_categories_router
 from .admin_news_media import router as admin_news_media_router
@@ -26,6 +33,7 @@ from .admin_payment_methods import router as admin_payment_methods_router
 from .admin_payments import router as admin_payments_router
 from .admin_pinned_messages import router as admin_pinned_messages_router
 from .admin_policies import router as admin_policies_router
+from .admin_polls import router as admin_polls_router
 from .admin_promo_offers import router as admin_promo_offers_router
 from .admin_promocodes import promo_groups_router as admin_promo_groups_router, router as admin_promocodes_router
 from .admin_referral_network import router as admin_referral_network_router
@@ -35,11 +43,14 @@ from .admin_sales_stats import router as admin_sales_stats_router
 from .admin_servers import router as admin_servers_router
 from .admin_settings import router as admin_settings_router
 from .admin_stats import router as admin_stats_router
+from .admin_system_logs import router as admin_system_logs_router
 from .admin_tariffs import router as admin_tariffs_router
 from .admin_tickets import router as admin_tickets_router
 from .admin_traffic import router as admin_traffic_router
 from .admin_updates import router as admin_updates_router
+from .admin_user_messages import router as admin_user_messages_router
 from .admin_users import router as admin_users_router
+from .admin_welcome_text import router as admin_welcome_text_router
 from .admin_wheel import router as admin_wheel_router
 from .admin_withdrawals import router as admin_withdrawals_router
 from .auth import router as auth_router
@@ -151,6 +162,18 @@ router.include_router(admin_apps_router)
 router.include_router(admin_roles_router)
 router.include_router(admin_policies_router)
 router.include_router(admin_audit_log_router)
+# Wave 1 parity routers (bot-admin features brought to the cabinet)
+router.include_router(admin_maintenance_router)
+router.include_router(admin_backup_router)
+router.include_router(admin_monitoring_router)
+router.include_router(admin_system_logs_router)
+router.include_router(admin_welcome_text_router)
+router.include_router(admin_user_messages_router)
+router.include_router(admin_legal_documents_router)
+router.include_router(admin_polls_router)
+router.include_router(admin_contests_router)
+router.include_router(admin_faq_router)
+router.include_router(admin_blacklist_router)
 # Categories/tags/media routers MUST be before the main news router
 # to avoid /admin/news/{article_id} catching /admin/news/categories etc.
 router.include_router(admin_news_categories_router)
