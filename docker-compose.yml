@@ -76,6 +76,9 @@ services:
       - ./uploads:/app/uploads:rw
       # Логотип для сообщений
       - ./vpn_logo.png:/app/vpn_logo.png:ro
+      - ./assets.brand.banner.mainmenu.jpg:/app/assets.brand.banner.mainmenu.jpg:ro
+      - ./assets.brand.banner.support.jpg:/app/assets.brand.banner.support.jpg:ro
+      - ./assets.brand.banner.referralprogram.jpg:/app/assets.brand.banner.referralprogram.jpg:ro
     ports:
       - '${WEB_API_PORT:-8080}:8080'
     networks:

@@ -697,6 +697,9 @@ class Settings(BaseSettings):
     HIDE_SUBSCRIPTION_LINK: bool = False
     ENABLE_LOGO_MODE: bool = True
     LOGO_FILE: str = 'vpn_logo.png'
+    MAIN_MENU_LOGO_FILE: str | None = 'assets.brand.banner.mainmenu.jpg'
+    SUPPORT_LOGO_FILE: str | None = 'assets.brand.banner.support.jpg'
+    REFERRAL_LOGO_FILE: str | None = 'assets.brand.banner.referralprogram.jpg'
     SKIP_RULES_ACCEPT: bool = False
     SKIP_REFERRAL_CODE: bool = False
 

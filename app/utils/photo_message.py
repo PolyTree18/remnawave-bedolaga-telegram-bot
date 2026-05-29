@@ -8,13 +8,14 @@ from aiogram.types import InaccessibleMessage, InputMediaPhoto
 from app.config import settings
 
 from .message_patch import (
-    LOGO_PATH,
+    BrandingLogoContext,
     _cache_logo_file_id,
     append_privacy_hint,
     caption_exceeds_telegram_limit,
     get_logo_media,
     is_privacy_restricted_error,
     is_qr_message,
+    logo_file_exists,
     prepare_privacy_safe_kwargs,
 )
 
@@ -25,14 +26,14 @@ MAX_RETRIES = 3
 RETRY_DELAY = 0.5
 
 
-def _resolve_media(message: types.Message):
+def _resolve_media(message: types.Message, logo_context: BrandingLogoContext):
     if isinstance(message, InaccessibleMessage):
-        return get_logo_media()
+        return get_logo_media(logo_context)
     if settings.ENABLE_LOGO_MODE and not is_qr_message(message):
-        return get_logo_media()
+        return get_logo_media(logo_context)
     if message.photo and not is_qr_message(message):
         return message.photo[-1].file_id
-    return get_logo_media()
+    return get_logo_media(logo_context)
 
 
 def _get_language(callback: types.CallbackQuery) -> str | None:
@@ -83,20 +84,21 @@ async def edit_or_answer_photo(
     parse_mode: str | None = 'HTML',
     *,
     force_text: bool = False,
+    logo_context: BrandingLogoContext = 'default',
 ) -> None:
     resolved_parse_mode = parse_mode or 'HTML'
 
     # Если сообщение недоступно, отправляем новое сообщение
     if isinstance(callback.message, InaccessibleMessage):
         try:
-            if settings.ENABLE_LOGO_MODE and LOGO_PATH.exists():
+            if settings.ENABLE_LOGO_MODE and logo_file_exists(logo_context):
                 result = await callback.message.answer_photo(
-                    photo=get_logo_media(),
+                    photo=get_logo_media(logo_context),
                     caption=caption,
                     reply_markup=keyboard,
                     parse_mode=resolved_parse_mode,
                 )
-                _cache_logo_file_id(result)
+                _cache_logo_file_id(result, logo_context)
             else:
                 await callback.message.answer(
                     caption,
@@ -149,7 +151,7 @@ async def edit_or_answer_photo(
             await _answer_text(callback, caption, keyboard, resolved_parse_mode, error)
         return
 
-    media = _resolve_media(callback.message)
+    media = _resolve_media(callback.message, logo_context)
 
     # Retry logic для сетевых ошибок
     for attempt in range(MAX_RETRIES):
@@ -197,12 +199,12 @@ async def edit_or_answer_photo(
             try:
                 # Отправим как фото с логотипом
                 result = await callback.message.answer_photo(
-                    photo=get_logo_media(),
+                    photo=get_logo_media(logo_context),
                     caption=caption,
                     reply_markup=keyboard,
                     parse_mode=resolved_parse_mode,
                 )
-                _cache_logo_file_id(result)
+                _cache_logo_file_id(result, logo_context)
             except (TelegramBadRequest, TelegramForbiddenError) as photo_error:
                 await _answer_text(callback, caption, keyboard, resolved_parse_mode, photo_error)
             except Exception:

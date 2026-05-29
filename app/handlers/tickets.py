@@ -22,6 +22,7 @@ from app.keyboards.inline import (
 from app.localization.texts import get_texts
 from app.services.admin_notification_service import AdminNotificationService
 from app.utils.cache import RateLimitCache, cache, cache_key
+from app.utils.message_patch import LOGO_CONTEXT_SUPPORT
 from app.utils.photo_message import edit_or_answer_photo
 from app.utils.timezone import format_local_datetime
 
@@ -386,6 +387,7 @@ async def show_my_tickets(callback: types.CallbackQuery, db_user: User, db: Asyn
         caption=texts.t('MY_TICKETS_TITLE', '📋 Ваши тикеты:'),
         keyboard=keyboard,
         parse_mode='HTML',
+        logo_context=LOGO_CONTEXT_SUPPORT,
     )
     await callback.answer()
 
@@ -446,6 +448,7 @@ async def show_my_tickets_closed(callback: types.CallbackQuery, db_user: User, d
         caption=texts.t('CLOSED_TICKETS_TITLE', '🟢 Закрытые тикеты:'),
         keyboard=kb,
         parse_mode='HTML',
+        logo_context=LOGO_CONTEXT_SUPPORT,
     )
     await callback.answer()
 

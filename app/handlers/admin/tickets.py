@@ -20,6 +20,7 @@ from app.localization.texts import get_texts
 from app.services.support_settings_service import SupportSettingsService
 from app.states import AdminTicketStates
 from app.utils.cache import RateLimitCache
+from app.utils.message_patch import LOGO_CONTEXT_SUPPORT
 
 
 logger = structlog.get_logger(__name__)
@@ -175,6 +176,7 @@ async def show_admin_tickets(callback: types.CallbackQuery, db_user: User, db: A
         caption=header_text,
         keyboard=keyboard,
         parse_mode='HTML',
+        logo_context=LOGO_CONTEXT_SUPPORT,
     )
     await callback.answer()
 

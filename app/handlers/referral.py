@@ -18,7 +18,8 @@ from app.localization.texts import get_texts
 from app.services.admin_notification_service import AdminNotificationService, NotificationCategory
 from app.services.referral_withdrawal_service import referral_withdrawal_service
 from app.states import ReferralWithdrawalStates
-from app.utils.photo_message import edit_or_answer_photo
+from app.utils.message_patch import LOGO_CONTEXT_REFERRAL
+from app.utils.photo_message import edit_or_answer_photo as _edit_or_answer_photo
 from app.utils.user_utils import (
     get_detailed_referral_list,
     get_effective_referral_commission_percent,
@@ -28,6 +29,11 @@ from app.utils.user_utils import (
 
 
 logger = structlog.get_logger(__name__)
+
+
+async def edit_or_answer_photo(*args, **kwargs):
+    kwargs.setdefault('logo_context', LOGO_CONTEXT_REFERRAL)
+    await _edit_or_answer_photo(*args, **kwargs)
 
 
 async def show_referral_info(callback: types.CallbackQuery, db_user: User, db: AsyncSession):

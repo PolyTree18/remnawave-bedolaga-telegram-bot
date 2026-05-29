@@ -34,6 +34,7 @@ from app.services.subscription_checkout_service import (
 )
 from app.services.support_settings_service import SupportSettingsService
 from app.services.user_cart_service import user_cart_service
+from app.utils.message_patch import LOGO_CONTEXT_MAIN_MENU
 from app.utils.photo_message import edit_or_answer_photo
 from app.utils.pricing_utils import format_period_description
 from app.utils.promo_offer import (
@@ -219,6 +220,7 @@ async def show_main_menu(
         caption=menu_text,
         keyboard=keyboard,
         parse_mode='HTML',
+        logo_context=LOGO_CONTEXT_MAIN_MENU,
     )
     if not skip_callback_answer:
         await callback.answer()
@@ -1065,6 +1067,7 @@ async def handle_back_to_menu(callback: types.CallbackQuery, state: FSMContext, 
         caption=menu_text,
         keyboard=keyboard,
         parse_mode='HTML',
+        logo_context=LOGO_CONTEXT_MAIN_MENU,
     )
     await callback.answer()
 
