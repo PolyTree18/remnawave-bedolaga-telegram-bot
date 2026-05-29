@@ -80,6 +80,18 @@ PERMISSION_REGISTRY: dict[str, list[str]] = {
     'bulk_actions': ['read', 'execute'],
     'info_pages': ['read', 'create', 'edit', 'delete'],
     'news': ['read', 'create', 'edit', 'delete'],
+    # Wave 1 parity domains (bot-admin features brought to the cabinet)
+    'maintenance': ['read', 'manage'],
+    'backup': ['read', 'manage'],
+    'monitoring': ['read', 'manage'],
+    'logs': ['read'],
+    'welcome_text': ['read', 'edit'],
+    'user_messages': ['read', 'manage'],
+    'legal': ['read', 'edit', 'manage'],
+    'polls': ['read', 'manage'],
+    'contests': ['read', 'manage'],
+    'faq': ['read', 'manage'],
+    'blacklist': ['read', 'manage'],
 }
 
 
