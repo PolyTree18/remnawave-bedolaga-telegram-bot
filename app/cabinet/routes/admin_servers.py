@@ -7,8 +7,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.crud.server_squad import (
     count_active_users_for_squad,
+    delete_server_squad,
     get_all_server_squads,
+    get_server_connected_users,
     get_server_squad_by_id,
+    sync_server_user_counts,
     sync_with_remnawave,
     update_server_squad,
     update_server_squad_promo_groups,
@@ -18,11 +21,17 @@ from app.services.subscription_service import SubscriptionService
 
 from ..dependencies import get_cabinet_db, require_permission
 from ..schemas.servers import (
+    ConnectedSubscriptionInfo,
+    ConnectedUserItem,
     PromoGroupInfo,
+    ServerConnectedUsersResponse,
+    ServerDeleteRequest,
+    ServerDeleteResponse,
     ServerDetailResponse,
     ServerListItem,
     ServerListResponse,
     ServerStatsResponse,
+    ServerSyncCountersResponse,
     ServerSyncResponse,
     ServerToggleResponse,
     ServerTrialToggleResponse,
@@ -326,4 +335,190 @@ async def sync_servers(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f'Sync failed: {e!s}',
+        )
+
+
+@router.delete('/{server_id}', response_model=ServerDeleteResponse)
+async def delete_existing_server(
+    server_id: int,
+    request: ServerDeleteRequest,
+    admin: User = Depends(require_permission('servers:edit')),
+    db: AsyncSession = Depends(get_cabinet_db),
+):
+    """Delete a server.
+
+    Destructive: mirrors the bot, which only removes a squad when it has no
+    active connections. ``delete_server_squad`` returns False when connections
+    still exist, in which case we surface a 409 instead of failing silently.
+    """
+    server = await get_server_squad_by_id(db, server_id)
+    if not server:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail='Server not found',
+        )
+
+    if not request.confirm:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail='Deletion must be confirmed (set "confirm": true)',
+        )
+
+    try:
+        # Guard against active connections exactly like the bot does.
+        active_subs = await count_active_users_for_squad(db, server.squad_uuid)
+        if active_subs > 0:
+            logger.warning(
+                'Admin delete server blocked: active connections',
+                admin_id=admin.id,
+                server_id=server_id,
+                squad_uuid=server.squad_uuid,
+                active_subscriptions=active_subs,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f'Server has {active_subs} active connection(s) and cannot be deleted',
+            )
+
+        # delete_server_squad re-checks SubscriptionServer links and refuses
+        # if any remain; treat a False result as a blocked deletion.
+        deleted = await delete_server_squad(db, server_id)
+        if not deleted:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail='Server has active connections and cannot be deleted',
+            )
+
+        logger.info(
+            'Admin deleted server',
+            admin_id=admin.id,
+            server_id=server_id,
+            squad_uuid=server.squad_uuid,
+            display_name=server.display_name,
+        )
+
+        return ServerDeleteResponse(
+            id=server_id,
+            deleted=True,
+            message=f'Server {server.display_name} deleted',
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error('Failed to delete server', error=e, server_id=server_id)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f'Delete failed: {e!s}',
+        )
+
+
+@router.get('/{server_id}/connected-users', response_model=ServerConnectedUsersResponse)
+async def get_server_connected_users_list(
+    server_id: int,
+    page: int = 1,
+    limit: int = 10,
+    admin: User = Depends(require_permission('servers:read')),
+    db: AsyncSession = Depends(get_cabinet_db),
+):
+    """List users connected to the squad with per-subscription status.
+
+    Mirrors the bot's "👥 Юзеры" view. ``get_server_connected_users`` returns
+    the full list (no DB-level pagination), so we paginate in Python the same
+    way the bot does.
+    """
+    server = await get_server_squad_by_id(db, server_id)
+    if not server:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail='Server not found',
+        )
+
+    page = max(page, 1)
+    if limit < 1:
+        limit = 1
+    elif limit > 100:
+        limit = 100
+
+    try:
+        users = await get_server_connected_users(db, server_id)
+        total = len(users)
+        total_pages = max((total + limit - 1) // limit, 1)
+        page = min(page, total_pages)
+
+        start = (page - 1) * limit
+        page_users = users[start : start + limit]
+
+        items: list[ConnectedUserItem] = []
+        for user in page_users:
+            sub_infos = [
+                ConnectedSubscriptionInfo(
+                    id=sub.id,
+                    status=sub.status,
+                    status_display=sub.status_display,
+                    is_active=sub.is_active,
+                    is_trial=sub.is_trial,
+                    tariff_name=sub.tariff.name if sub.tariff else None,
+                    end_date=sub.end_date,
+                )
+                for sub in (user.subscriptions or [])
+            ]
+            items.append(
+                ConnectedUserItem(
+                    id=user.id,
+                    telegram_id=user.telegram_id,
+                    username=user.username,
+                    full_name=user.full_name,
+                    subscriptions=sub_infos,
+                )
+            )
+
+        return ServerConnectedUsersResponse(
+            server_id=server_id,
+            squad_uuid=server.squad_uuid,
+            display_name=server.display_name,
+            users=items,
+            total=total,
+            page=page,
+            limit=limit,
+            total_pages=total_pages,
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error('Failed to list connected users', error=e, server_id=server_id)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f'Failed to list connected users: {e!s}',
+        )
+
+
+@router.post('/sync-counters', response_model=ServerSyncCountersResponse)
+async def sync_server_counters(
+    admin: User = Depends(require_permission('servers:edit')),
+    db: AsyncSession = Depends(get_cabinet_db),
+):
+    """Recalculate per-server user counters from real subscription data.
+
+    Mirrors the bot's "📊 Синхронизировать счетчики" action. This is a mass
+    write across every server row, so the admin_id is logged for review.
+    """
+    try:
+        logger.info('Admin syncing server counters', admin_id=admin.id, scope='all_servers')
+
+        updated_count = await sync_server_user_counts(db)
+
+        logger.info('Admin synced server counters', admin_id=admin.id, updated_servers=updated_count)
+
+        return ServerSyncCountersResponse(
+            updated_servers=updated_count,
+            message=f'Synced counters for {updated_count} server(s)',
+        )
+
+    except Exception as e:
+        logger.error('Failed to sync server counters', error=e)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f'Counter sync failed: {e!s}',
         )

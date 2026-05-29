@@ -4,14 +4,22 @@ import math
 from datetime import UTC, datetime, timedelta
 
 import structlog
+from aiogram import Bot
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from pydantic import BaseModel, Field
 from sqlalchemy import Integer, and_, delete as sa_delete, func, literal, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.bot_factory import create_bot
 from app.cabinet.utils.device_ownership import verify_hwid_belongs_to_user
 from app.config import settings
 from app.database.crud.campaign import get_campaign_registration_by_user
+from app.database.crud.server_squad import (
+    get_all_server_squads,
+    get_server_squad_by_id,
+)
 from app.database.crud.subscription import (
     extend_subscription,
 )
@@ -3709,3 +3717,367 @@ def _build_gift_item(
         paid_at=p.paid_at,
         delivered_at=p.delivered_at,
     )
+
+
+# =============================================================================
+# Direct Telegram message + connected servers (squads) editing
+#
+# Parity with bot admin handlers:
+#   - start_send_user_message / process_send_user_message  -> send_user_message
+#   - show_server_selection / toggle_user_server           -> get/edit connected servers
+# Business logic (panel push) mirrors app/handlers/admin/users.py exactly;
+# no new service methods are invented — RemnaWaveService.update_user is reused.
+# =============================================================================
+
+
+def _get_bot() -> Bot:
+    """Create a Bot instance for sending direct Telegram messages."""
+    return create_bot()
+
+
+async def _resolve_admin_subscription_for_user(
+    db: AsyncSession,
+    user: User,
+    subscription_id: int | None = None,
+) -> Subscription | None:
+    """Resolve the subscription an admin operation should target.
+
+    Mirrors app/handlers/admin/users.py::_resolve_admin_subscription:
+    - explicit subscription_id (multi-tariff) -> that subscription if it belongs to the user
+    - otherwise the first active subscription, falling back to the most recent one
+    """
+    if subscription_id is not None and settings.is_multi_tariff_enabled():
+        from app.database.crud.subscription import get_subscription_by_id_for_user
+
+        return await get_subscription_by_id_for_user(db, subscription_id, user.id)
+
+    subs = getattr(user, 'subscriptions', None) or []
+    if subscription_id is not None:
+        return next((s for s in subs if s.id == subscription_id), None)
+    return next((s for s in subs if s.is_active), subs[0] if subs else None)
+
+
+# === Schemas ===
+
+
+class SendUserMessageRequest(BaseModel):
+    """Request to send a direct Telegram message to a user."""
+
+    text: str = Field(..., min_length=1, max_length=4096, description='Message text (HTML allowed)')
+
+
+class SendUserMessageResponse(BaseModel):
+    """Result of a direct Telegram message send."""
+
+    success: bool
+    message: str
+
+
+class UserServerItem(BaseModel):
+    """A server (squad) that can be connected to a subscription."""
+
+    id: int
+    squad_uuid: str
+    display_name: str
+    is_available: bool
+    is_connected: bool
+
+
+class UserServersResponse(BaseModel):
+    """List of servers for a user's subscription with connection state."""
+
+    subscription_id: int
+    connected_squads: list[str]
+    servers: list[UserServerItem]
+
+
+class EditConnectedSquadsRequest(BaseModel):
+    """Edit the squads connected to a subscription.
+
+    Provide exactly one of:
+    - **add_server_id** / **remove_server_id**: toggle a single server (mirrors the bot).
+    - **connected_squads**: replace the full set of connected squad UUIDs.
+    """
+
+    subscription_id: int | None = Field(None, description='Target subscription (multi-tariff)')
+    add_server_id: int | None = Field(None, description='ServerSquad id to connect')
+    remove_server_id: int | None = Field(None, description='ServerSquad id to disconnect')
+    connected_squads: list[str] | None = Field(None, description='Full replacement set of squad UUIDs')
+
+
+class EditConnectedSquadsResponse(BaseModel):
+    """Result of editing connected squads."""
+
+    success: bool
+    message: str
+    connected_squads: list[str]
+    panel_synced: bool
+
+
+# === Endpoints ===
+
+
+@router.post('/{user_id}/send-message', response_model=SendUserMessageResponse)
+async def send_user_message(
+    user_id: int,
+    request: SendUserMessageRequest,
+    admin: User = Depends(require_permission('users:edit')),
+    db: AsyncSession = Depends(get_cabinet_db),
+):
+    """
+    Send a direct Telegram message to a user from the admin card.
+
+    Mirrors the bot's start_send_user_message / process_send_user_message:
+    - Rejects email-only users (no telegram_id).
+    - Handles TelegramForbiddenError (user blocked the bot) and TelegramBadRequest.
+    """
+    user = await get_user_by_id(db, user_id)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail='User not found',
+        )
+
+    text = (request.text or '').strip()
+    if not text:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail='Message text must not be empty',
+        )
+
+    if not user.telegram_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail='This user is registered by email only and cannot receive Telegram messages',
+        )
+
+    bot = _get_bot()
+    try:
+        await bot.send_message(user.telegram_id, text, parse_mode='HTML')
+        logger.info(
+            'Admin sent direct message to user',
+            admin_id=admin.id,
+            user_id=user_id,
+            telegram_id=user.telegram_id,
+        )
+        return SendUserMessageResponse(success=True, message='Message sent to user')
+    except TelegramForbiddenError:
+        logger.warning(
+            'Direct message blocked by user', admin_id=admin.id, user_id=user_id, telegram_id=user.telegram_id
+        )
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail='User has blocked the bot or cannot receive messages',
+        )
+    except TelegramBadRequest as err:
+        logger.error('Telegram rejected admin message', user_id=user_id, telegram_id=user.telegram_id, error=err)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail='Telegram rejected the message. Check the text and try again.',
+        )
+    except Exception as err:
+        logger.error('Failed to send direct message to user', user_id=user_id, error=err)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail='Failed to send the message. Try again later.',
+        )
+    finally:
+        try:
+            await bot.session.close()
+        except Exception:
+            pass
+
+
+@router.get('/{user_id}/servers', response_model=UserServersResponse)
+async def get_user_servers(
+    user_id: int,
+    admin: User = Depends(require_permission('users:subscription')),
+    db: AsyncSession = Depends(get_cabinet_db),
+    subscription_id: int | None = Query(None, description='Subscription ID for multi-tariff'),
+):
+    """
+    List servers (squads) for a user's subscription with their connection state.
+
+    Mirrors the bot's show_server_selection: available servers plus any already-connected
+    (even if currently unavailable) server.
+    """
+    user = await get_user_by_id(db, user_id)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail='User not found',
+        )
+
+    subscription = await _resolve_admin_subscription_for_user(db, user, subscription_id)
+    if not subscription:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail='User has no subscription',
+        )
+
+    try:
+        current_squads = list(subscription.connected_squads or [])
+        all_servers, _ = await get_all_server_squads(db, available_only=False)
+
+        items: list[UserServerItem] = []
+        for server in all_servers:
+            is_connected = server.squad_uuid in current_squads
+            # Show available servers and any already-connected server (mirror bot filter)
+            if not server.is_available and not is_connected:
+                continue
+            items.append(
+                UserServerItem(
+                    id=server.id,
+                    squad_uuid=server.squad_uuid,
+                    display_name=server.display_name,
+                    is_available=server.is_available,
+                    is_connected=is_connected,
+                )
+            )
+
+        # Selected first, then available, then inactive (mirror bot ordering)
+        items.sort(key=lambda s: (not s.is_connected, not s.is_available))
+
+        return UserServersResponse(
+            subscription_id=subscription.id,
+            connected_squads=current_squads,
+            servers=items,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error('Error listing servers for user', user_id=user_id, error=e)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail='Failed to list servers',
+        )
+
+
+@router.post('/{user_id}/servers', response_model=EditConnectedSquadsResponse)
+async def edit_user_connected_squads(
+    user_id: int,
+    request: EditConnectedSquadsRequest,
+    admin: User = Depends(require_permission('users:subscription')),
+    db: AsyncSession = Depends(get_cabinet_db),
+):
+    """
+    Edit the servers (squads) connected to a user's subscription and push to RemnaWave.
+
+    Mirrors the bot's toggle_user_server (single add/remove) and supports a full
+    replacement via connected_squads. After updating the DB, the new squad set is
+    pushed to the panel via RemnaWaveService.update_user (active_internal_squads).
+    """
+    provided = [
+        request.add_server_id is not None,
+        request.remove_server_id is not None,
+        request.connected_squads is not None,
+    ]
+    if sum(provided) != 1:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail='Provide exactly one of: add_server_id, remove_server_id, connected_squads',
+        )
+
+    user = await get_user_by_id(db, user_id)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail='User not found',
+        )
+
+    subscription = await _resolve_admin_subscription_for_user(db, user, request.subscription_id)
+    if not subscription:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail='User has no subscription',
+        )
+
+    try:
+        current_squads = list(subscription.connected_squads or [])
+
+        if request.connected_squads is not None:
+            # Full replacement: validate every UUID against known servers
+            all_servers, _ = await get_all_server_squads(db, available_only=False)
+            known_uuids = {s.squad_uuid for s in all_servers}
+            unknown = [u for u in request.connected_squads if u not in known_uuids]
+            if unknown:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f'Unknown squad UUIDs: {", ".join(unknown)}',
+                )
+            new_squads = list(dict.fromkeys(request.connected_squads))
+            action_text = 'replaced'
+        else:
+            server_id = request.add_server_id if request.add_server_id is not None else request.remove_server_id
+            server = await get_server_squad_by_id(db, server_id)
+            if not server:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail='Server not found',
+                )
+            new_squads = list(current_squads)
+            if request.add_server_id is not None:
+                if server.squad_uuid not in new_squads:
+                    new_squads.append(server.squad_uuid)
+                action_text = 'added'
+            else:
+                if server.squad_uuid in new_squads:
+                    new_squads.remove(server.squad_uuid)
+                action_text = 'removed'
+
+        subscription.connected_squads = new_squads
+        subscription.updated_at = datetime.now(UTC)
+        await db.commit()
+        await db.refresh(subscription)
+
+        # Push to RemnaWave (mirror toggle_user_server). Resolve panel UUID the same way.
+        panel_synced = False
+        _uuid = (
+            getattr(subscription, 'remnawave_uuid', None) if settings.is_multi_tariff_enabled() else None
+        ) or getattr(user, 'remnawave_uuid', None)
+        if _uuid:
+            try:
+                from app.services.remnawave_service import RemnaWaveService
+
+                service = RemnaWaveService()
+                if service.is_configured:
+                    async with service.get_api_client() as api:
+                        await api.update_user(
+                            uuid=_uuid,
+                            active_internal_squads=new_squads,
+                            description=settings.format_remnawave_user_description(
+                                full_name=user.full_name,
+                                username=user.username,
+                                telegram_id=user.telegram_id,
+                                email=user.email,
+                                user_id=user.id,
+                            ),
+                        )
+                    panel_synced = True
+            except Exception as rw_error:
+                logger.error('Failed to push connected squads to RemnaWave', user_id=user_id, error=rw_error)
+
+        logger.info(
+            'Admin edited connected squads for user',
+            admin_id=admin.id,
+            user_id=user_id,
+            subscription_id=subscription.id,
+            action=action_text,
+            squad_count=len(new_squads),
+        )
+
+        return EditConnectedSquadsResponse(
+            success=True,
+            message=f'Connected servers {action_text}',
+            connected_squads=new_squads,
+            panel_synced=panel_synced,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        await db.rollback()
+        logger.error('Error editing connected squads for user', user_id=user_id, error=e)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail='Failed to edit connected servers',
+        )

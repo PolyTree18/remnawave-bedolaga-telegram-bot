@@ -177,6 +177,7 @@ async def create_tariff(
     period_prices: dict[int, int] | None = None,
     tier_level: int = 1,
     is_trial_available: bool = False,
+    trial_duration_days: int | None = None,
     allow_traffic_topup: bool = True,
     promo_group_ids: list[int] | None = None,
     traffic_topup_enabled: bool = False,
@@ -218,6 +219,7 @@ async def create_tariff(
         period_prices=normalized_prices,
         tier_level=max(1, tier_level),
         is_trial_available=is_trial_available,
+        trial_duration_days=trial_duration_days,
         allow_traffic_topup=allow_traffic_topup,
         traffic_topup_enabled=traffic_topup_enabled,
         traffic_topup_packages=traffic_topup_packages or {},
@@ -286,6 +288,7 @@ async def update_tariff(
     period_prices: dict[int, int] | None = None,
     tier_level: int | None = None,
     is_trial_available: bool | None = None,
+    trial_duration_days: int | None = ...,  # ... = не передан, None = сбросить к глобальной настройке
     allow_traffic_topup: bool | None = None,
     promo_group_ids: list[int] | None = None,
     traffic_topup_enabled: bool | None = None,
@@ -341,6 +344,8 @@ async def update_tariff(
         tariff.tier_level = max(1, tier_level)
     if is_trial_available is not None:
         tariff.is_trial_available = is_trial_available
+    if trial_duration_days is not ...:  # None = сбросить к глобальной настройке
+        tariff.trial_duration_days = trial_duration_days
     if traffic_topup_enabled is not None:
         tariff.traffic_topup_enabled = traffic_topup_enabled
     if traffic_topup_packages is not None:

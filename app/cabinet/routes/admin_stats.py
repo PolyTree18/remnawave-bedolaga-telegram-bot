@@ -13,7 +13,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.crud.campaign import get_campaign_statistics, get_campaigns_count, get_campaigns_list
 from app.database.crud.server_squad import get_server_statistics
-from app.database.crud.subscription import get_subscriptions_statistics
+from app.database.crud.subscription import (
+    get_subscriptions_statistics,
+    get_trial_statistics,
+    reset_trials_for_users_without_paid_subscription,
+)
 from app.database.crud.transaction import REAL_PAYMENT_METHODS, get_revenue_by_period, get_transactions_statistics
 from app.database.models import (
     ReferralEarning,
@@ -962,4 +966,107 @@ async def get_recent_payments(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail='Failed to load recent payments',
+        )
+
+
+# ============ Trials Schemas ============
+
+
+class TrialStatsResponse(BaseModel):
+    """Trial usage statistics, mirroring the bot admin trials panel."""
+
+    used_trials: int
+    active_trials: int
+    resettable_trials: int
+
+
+class ResetTrialsRequest(BaseModel):
+    """Request body for the destructive bulk trial reset."""
+
+    confirm: bool = False
+
+
+class ResetTrialsResponse(BaseModel):
+    """Result of the bulk trial reset."""
+
+    reset_count: int
+    used_trials: int
+    active_trials: int
+    resettable_trials: int
+
+
+# ============ Trials Routes ============
+
+
+@router.get('/trials', response_model=TrialStatsResponse)
+async def get_trial_stats(
+    admin: User = Depends(require_permission('users:subscription')),
+    db: AsyncSession = Depends(get_cabinet_db),
+):
+    """Get trial statistics, including the resettable-count metric.
+
+    Mirrors the bot's admin trials panel (``show_trials_panel``).
+    """
+    try:
+        stats = await get_trial_statistics(db)
+        return TrialStatsResponse(
+            used_trials=stats.get('used_trials', 0),
+            active_trials=stats.get('active_trials', 0),
+            resettable_trials=stats.get('resettable_trials', 0),
+        )
+    except Exception as e:
+        logger.error('Failed to get trial statistics', error=e, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail='Failed to load trial statistics',
+        )
+
+
+@router.post('/trials/reset', response_model=ResetTrialsResponse)
+async def reset_trials(
+    payload: ResetTrialsRequest,
+    admin: User = Depends(require_permission('users:subscription')),
+    db: AsyncSession = Depends(get_cabinet_db),
+):
+    """Reset all trials for users without a paid subscription (bulk, destructive).
+
+    Mirrors the bot's ``reset_trials`` handler. Deletes every expired trial
+    subscription belonging to a user who has never had a paid subscription.
+    Requires an explicit ``confirm`` flag in the request body.
+    """
+    if not payload.confirm:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail='Confirmation required: set "confirm": true to reset trials.',
+        )
+
+    try:
+        logger.warning(
+            'Admin initiating bulk trial reset',
+            admin_id=admin.id,
+            scope='users_without_paid_subscription',
+        )
+        reset_count = await reset_trials_for_users_without_paid_subscription(db)
+        stats = await get_trial_statistics(db)
+
+        logger.info(
+            'Admin completed bulk trial reset',
+            admin_id=admin.id,
+            scope='users_without_paid_subscription',
+            reset_count=reset_count,
+        )
+
+        return ResetTrialsResponse(
+            reset_count=reset_count,
+            used_trials=stats.get('used_trials', 0),
+            active_trials=stats.get('active_trials', 0),
+            resettable_trials=stats.get('resettable_trials', 0),
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error('Failed to reset trials', admin_id=admin.id, error=e, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail='Failed to reset trials',
         )

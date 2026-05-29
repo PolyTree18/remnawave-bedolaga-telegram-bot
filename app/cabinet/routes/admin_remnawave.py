@@ -1001,3 +1001,84 @@ async def get_sync_recommendations(
         message='Recommendations retrieved',
         data=data,
     )
+
+
+# ============ Force Cleanup (DESTRUCTIVE) ============
+
+
+class ForceCleanupRequest(BaseModel):
+    """Confirmation payload for the destructive force-cleanup of orphaned users.
+
+    This wipes ALL data (subscriptions, transactions, referral earnings,
+    connected servers, RemnaWave UUIDs and HWID devices) for every user that
+    no longer exists in the RemnaWave panel. Balances are preserved. The
+    operation is irreversible, so it requires an explicit confirmation flag.
+    """
+
+    confirm: bool = False
+
+
+@router.post('/sync/orphaned/force-cleanup', response_model=SyncResponse)
+async def force_cleanup_orphaned_users(
+    payload: ForceCleanupRequest,
+    admin: User = Depends(require_permission('remnawave:manage')),
+    db: AsyncSession = Depends(get_cabinet_db),
+) -> SyncResponse:
+    """Force-cleanup ALL users missing from the RemnaWave panel.
+
+    This is the destructive full wipe the bot exposes (the double-confirm
+    "ДА, ОЧИСТИТЬ ВСЕ" action). It wraps the same ``cleanup_orphaned_subscriptions``
+    service method, which fully resets every orphaned user's data via
+    ``force_cleanup_user_data`` (subscriptions reset, transactions / referral
+    earnings / connected servers deleted, RemnaWave UUIDs cleared, HWID devices
+    reset). Balances are preserved. Requires ``confirm=true`` in the body.
+    """
+    if not payload.confirm:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail='Confirmation required: set "confirm": true to force-cleanup orphaned users',
+        )
+
+    service = _get_service()
+    _ensure_configured(service)
+
+    logger.warning(
+        'Admin initiated DESTRUCTIVE force-cleanup of orphaned users',
+        admin_id=admin.id,
+        admin_telegram_id=admin.telegram_id,
+        scope='all_orphaned_users',
+    )
+
+    try:
+        stats = await service.cleanup_orphaned_subscriptions(db)
+    except RemnaWaveConfigurationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(exc),
+        )
+    except Exception as exc:
+        logger.error(
+            'Force-cleanup of orphaned users failed',
+            admin_id=admin.id,
+            error=exc,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail='Failed to force-cleanup orphaned users',
+        )
+
+    logger.warning(
+        'Admin completed force-cleanup of orphaned users',
+        admin_id=admin.id,
+        admin_telegram_id=admin.telegram_id,
+        scope='all_orphaned_users',
+        checked=stats.get('checked', 0),
+        deactivated=stats.get('deactivated', 0),
+        errors=stats.get('errors', 0),
+    )
+
+    return SyncResponse(
+        success=stats.get('errors', 0) == 0,
+        message='Force-cleanup completed with errors' if stats.get('errors', 0) else 'Force-cleanup completed',
+        data=stats,
+    )

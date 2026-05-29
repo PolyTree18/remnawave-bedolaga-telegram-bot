@@ -15,6 +15,7 @@ from app.database.crud.promo_group import (
     create_promo_group,
     delete_promo_group,
     get_promo_group_by_id,
+    get_promo_group_members,
     get_promo_groups_with_counts,
     update_promo_group,
 )
@@ -119,6 +120,7 @@ class PromoCodeUpdateRequest(BaseModel):
 class PromoGroupResponse(BaseModel):
     id: int
     name: str
+    priority: int = 0
     server_discount_percent: int
     traffic_discount_percent: int
     device_discount_percent: int
@@ -140,6 +142,7 @@ class PromoGroupListResponse(BaseModel):
 
 class PromoGroupCreateRequest(BaseModel):
     name: str
+    priority: int = Field(default=0, ge=0)
     server_discount_percent: int = 0
     traffic_discount_percent: int = 0
     device_discount_percent: int = 0
@@ -151,6 +154,7 @@ class PromoGroupCreateRequest(BaseModel):
 
 class PromoGroupUpdateRequest(BaseModel):
     name: str | None = None
+    priority: int | None = Field(default=None, ge=0)
     server_discount_percent: int | None = None
     traffic_discount_percent: int | None = None
     device_discount_percent: int | None = None
@@ -231,6 +235,7 @@ def _serialize_promo_group(group: PromoGroup, members_count: int = 0) -> PromoGr
     return PromoGroupResponse(
         id=group.id,
         name=group.name,
+        priority=getattr(group, 'priority', 0) or 0,
         server_discount_percent=group.server_discount_percent,
         traffic_discount_percent=group.traffic_discount_percent,
         device_discount_percent=group.device_discount_percent,
@@ -623,6 +628,7 @@ async def create_promo_group_endpoint(
         group = await create_promo_group(
             db,
             name=payload.name,
+            priority=payload.priority,
             server_discount_percent=payload.server_discount_percent,
             traffic_discount_percent=payload.traffic_discount_percent,
             device_discount_percent=payload.device_discount_percent,
@@ -660,6 +666,7 @@ async def update_promo_group_endpoint(
             db,
             group,
             name=payload.name,
+            priority=payload.priority,
             server_discount_percent=payload.server_discount_percent,
             traffic_discount_percent=payload.traffic_discount_percent,
             device_discount_percent=payload.device_discount_percent,
@@ -695,3 +702,55 @@ async def delete_promo_group_endpoint(
         raise HTTPException(status.HTTP_400_BAD_REQUEST, 'Cannot delete default promo group')
 
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+# ============== PromoGroup Members ==============
+
+
+class PromoGroupMemberResponse(BaseModel):
+    id: int
+    telegram_id: int | None = None
+    username: str | None = None
+    full_name: str | None = None
+    email: str | None = None
+
+
+class PromoGroupMembersListResponse(BaseModel):
+    items: list[PromoGroupMemberResponse]
+    total: int
+    limit: int
+    offset: int
+
+
+def _serialize_promo_group_member(user: User) -> PromoGroupMemberResponse:
+    return PromoGroupMemberResponse(
+        id=user.id,
+        telegram_id=getattr(user, 'telegram_id', None),
+        username=getattr(user, 'username', None),
+        full_name=getattr(user, 'full_name', None),
+        email=getattr(user, 'email', None),
+    )
+
+
+@promo_groups_router.get('/{group_id}/members', response_model=PromoGroupMembersListResponse)
+async def list_promo_group_members(
+    group_id: int,
+    admin: User = Depends(require_permission('promo_groups:edit')),
+    db: AsyncSession = Depends(get_cabinet_db),
+    limit: int = Query(20, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+) -> PromoGroupMembersListResponse:
+    """Get paginated members of a promo group (mirrors the bot's members view)."""
+    group = await get_promo_group_by_id(db, group_id)
+    if not group:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, 'Promo group not found')
+
+    total = await count_promo_group_members(db, group_id)
+    members = await get_promo_group_members(db, group_id, offset=offset, limit=limit)
+
+    return PromoGroupMembersListResponse(
+        items=[_serialize_promo_group_member(user) for user in members],
+        total=int(total),
+        limit=limit,
+        offset=offset,
+    )

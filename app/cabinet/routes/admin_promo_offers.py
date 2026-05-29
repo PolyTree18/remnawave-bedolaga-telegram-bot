@@ -15,6 +15,7 @@ from pydantic import BaseModel, Field, validator
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.bot_factory import create_bot
+from app.config import settings
 from app.database.crud.discount_offer import (
     count_discount_offers,
     list_discount_offers,
@@ -27,9 +28,14 @@ from app.database.crud.promo_offer_template import (
     list_promo_offer_templates,
     update_promo_offer_template,
 )
-from app.database.crud.user import get_user_by_email, get_user_by_telegram_id
+from app.database.crud.user import get_user_by_email, get_user_by_telegram_id, get_users_for_promo_segment
 from app.database.models import DiscountOffer, PromoOfferLog, PromoOfferTemplate, User
 from app.handlers.admin.messages import get_custom_users, get_target_users
+from app.handlers.admin.promo_offers import (
+    OFFER_TYPE_CONFIG,
+    _render_template_text,
+    _resolve_template_squad,
+)
 from app.utils.miniapp_buttons import build_miniapp_or_callback_button
 
 from ..dependencies import get_cabinet_db, require_permission
@@ -636,3 +642,260 @@ async def get_logs(
         limit=limit,
         offset=offset,
     )
+
+
+# ============== Template Send Endpoint (offer-type-aware) ==============
+
+
+class PromoOfferTemplateSendRequest(BaseModel):
+    """Send a promo-offer template to a valid promo segment.
+
+    Mirrors the bot's send_offer_to_segment: targeting is restricted to the
+    segments allowed for the template's offer_type, recipients come from
+    get_users_for_promo_segment (NOT generic broadcast segmentation), and for
+    test_access offers users who already have the target squad connected are
+    skipped (dedup).
+    """
+
+    segment: str = Field(..., min_length=1, description='Promo segment key allowed for this offer type')
+    confirm: bool = Field(False, description='Must be true to execute this mass send')
+
+
+class PromoOfferTemplateSendResponse(BaseModel):
+    template_id: int
+    offer_type: str
+    segment: str
+    eligible_users: int
+    skipped_already_has_squad: int = 0
+    created_offers: int = 0
+    notifications_sent: int = 0
+    notifications_failed: int = 0
+
+
+def _user_connected_squads(user: User) -> set[str]:
+    """Collect connected squad UUIDs for a user, multi-tariff aware.
+
+    Mirrors the bot's already-has-squad detection in send_offer_to_segment.
+    """
+    if settings.is_multi_tariff_enabled():
+        all_squads: set[str] = set()
+        for sub in getattr(user, 'subscriptions', None) or []:
+            all_squads.update(sub.connected_squads or [])
+        return all_squads
+
+    subscription = getattr(user, 'subscription', None)
+    return set(subscription.connected_squads or []) if subscription else set()
+
+
+def _resolve_offer_subscription_id(user: User) -> int | None:
+    """Pick the subscription id to attach to the offer, mirroring the bot."""
+    if settings.is_multi_tariff_enabled():
+        user_subs = getattr(user, 'subscriptions', None) or []
+        active_subs = [s for s in user_subs if s.is_active]
+        if active_subs:
+            non_daily = [s for s in active_subs if not getattr(s, 'is_daily_tariff', False)]
+            eligible = non_daily or active_subs
+            best = max(eligible, key=lambda s: s.days_left)
+            return best.id
+        if user_subs:
+            return user_subs[0].id
+        return None
+
+    subscription = getattr(user, 'subscription', None)
+    return subscription.id if subscription else None
+
+
+async def _send_template_offer_notifications(
+    *,
+    template: PromoOfferTemplate,
+    users: list[User],
+    squad_name: str | None,
+    effect_type: str,
+    fallback_language: str,
+    db: AsyncSession,
+) -> tuple[int, int]:
+    """Create offers and send Telegram notifications, mirroring _send_offer_to_users.
+
+    Returns (sent, failed). Email-only users (no telegram_id) are skipped.
+    """
+    if not users:
+        return 0, 0
+
+    bot = _get_bot()
+    sent = 0
+    failed = 0
+    semaphore = asyncio.Semaphore(20)
+
+    async def send_single(user: User) -> bool:
+        if not user.telegram_id:
+            logger.debug('Skipping promo template send for email-only user', user_id=user.id)
+            return False
+
+        async with semaphore:
+            try:
+                offer_record = await upsert_discount_offer(
+                    db,
+                    user_id=user.id,
+                    subscription_id=_resolve_offer_subscription_id(user),
+                    notification_type=f'promo_template_{template.id}',
+                    discount_percent=template.discount_percent,
+                    bonus_amount_kopeks=0,
+                    valid_hours=template.valid_hours,
+                    effect_type=effect_type,
+                    extra_data={
+                        'template_id': template.id,
+                        'offer_type': template.offer_type,
+                        'test_duration_hours': template.test_duration_hours,
+                        'test_squad_uuids': template.test_squad_uuids,
+                        'active_discount_hours': template.active_discount_hours,
+                    },
+                )
+
+                message_text = _render_template_text(
+                    template,
+                    user.language or fallback_language,
+                    server_name=squad_name,
+                )
+                keyboard = InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [
+                            build_miniapp_or_callback_button(
+                                text=template.button_text,
+                                callback_data=f'claim_discount_{offer_record.id}',
+                            )
+                        ],
+                        [
+                            InlineKeyboardButton(
+                                text='❌ Закрыть',
+                                callback_data='promo_offer_close',
+                            )
+                        ],
+                    ]
+                )
+                await bot.send_message(
+                    chat_id=user.telegram_id,
+                    text=message_text,
+                    reply_markup=keyboard,
+                    parse_mode='HTML',
+                )
+                return True
+            except (TelegramForbiddenError, TelegramBadRequest) as exc:
+                logger.warning('Failed to send promo template offer', telegram_id=user.telegram_id, exc=exc)
+                return False
+            except Exception as exc:
+                logger.error('Error sending promo template offer', telegram_id=user.telegram_id, exc=exc)
+                return False
+
+    batch_size = 100
+    for i in range(0, len(users), batch_size):
+        batch = users[i : i + batch_size]
+        results = await asyncio.gather(*(send_single(user) for user in batch), return_exceptions=True)
+        for result in results:
+            if isinstance(result, bool) and result:
+                sent += 1
+            else:
+                failed += 1
+        if i + batch_size < len(users):
+            await asyncio.sleep(0.1)
+
+    await bot.session.close()
+    return sent, failed
+
+
+@router.post(
+    '/templates/{template_id}/send',
+    response_model=PromoOfferTemplateSendResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def send_template_offer(
+    template_id: int,
+    payload: PromoOfferTemplateSendRequest,
+    admin: User = Depends(require_permission('promo_offers:send')),
+    db: AsyncSession = Depends(get_cabinet_db),
+) -> PromoOfferTemplateSendResponse:
+    """Send a promo-offer template to a valid segment (offer-type-aware + dedup).
+
+    Faithful to the bot's send_offer_to_segment:
+      - segment must be one of the template offer_type's allowed_segments;
+      - recipients come from get_users_for_promo_segment (not generic broadcast);
+      - for test_access with a configured squad, users who already have that
+        squad connected are skipped.
+
+    This is a mass operation: requires confirm=true and logs admin_id + scope.
+    """
+    template = await get_promo_offer_template_by_id(db, template_id)
+    if not template:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, 'Template not found')
+
+    config = OFFER_TYPE_CONFIG.get(template.offer_type)
+    if not config:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            f'Unknown offer type: {template.offer_type}',
+        )
+
+    segment = payload.segment.strip().lower()
+    allowed_segments = {seg for seg, _ in config.get('allowed_segments', [])}
+    if segment not in allowed_segments:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            f"Segment '{segment}' is not allowed for offer type '{template.offer_type}'. "
+            f'Allowed: {sorted(allowed_segments)}',
+        )
+
+    if not payload.confirm:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            'Mass send requires confirm=true',
+        )
+
+    try:
+        squad_uuid, squad_name = await _resolve_template_squad(db, template)
+
+        users = await get_users_for_promo_segment(db, segment)
+        initial_count = len(users)
+
+        # Dedup: for test_access offers, skip users that already have the squad.
+        if template.offer_type == 'test_access' and squad_uuid:
+            users = [user for user in users if squad_uuid not in _user_connected_squads(user)]
+
+        skipped = initial_count - len(users)
+        effect_type = config.get('effect_type', 'percent_discount')
+
+        logger.info(
+            'Cabinet admin promo template send',
+            admin_id=admin.id,
+            template_id=template.id,
+            offer_type=template.offer_type,
+            segment=segment,
+            eligible_users=len(users),
+            skipped_already_has_squad=skipped,
+        )
+
+        sent, failed = await _send_template_offer_notifications(
+            template=template,
+            users=users,
+            squad_name=squad_name,
+            effect_type=effect_type,
+            fallback_language=admin.language,
+            db=db,
+        )
+
+        return PromoOfferTemplateSendResponse(
+            template_id=template.id,
+            offer_type=template.offer_type,
+            segment=segment,
+            eligible_users=len(users),
+            skipped_already_has_squad=skipped,
+            created_offers=sent,
+            notifications_sent=sent,
+            notifications_failed=failed,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error('Failed to send promo template offer', admin_id=admin.id, template_id=template_id, exc=exc)
+        raise HTTPException(
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            'Failed to send promo offer',
+        ) from exc

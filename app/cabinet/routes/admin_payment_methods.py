@@ -1,12 +1,15 @@
 """Admin routes for payment method configuration in cabinet."""
 
+import time
 from datetime import datetime
 
 import structlog
+from aiogram import Bot
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import settings
 from app.database.models import User
 from app.services.payment_method_config_service import (
     _get_method_defaults,
@@ -16,6 +19,7 @@ from app.services.payment_method_config_service import (
     update_config,
     update_sort_order,
 )
+from app.services.payment_service import PaymentService
 
 from ..dependencies import get_cabinet_db, require_permission
 
@@ -245,3 +249,494 @@ async def update_payment_method(
 
     defaults = _get_method_defaults()
     return _enrich_config(config, defaults)
+
+
+# ============ Provider test schemas ============
+
+
+class PaymentTestRequest(BaseModel):
+    """Body for creating a real low-value test payment.
+
+    A test payment is a real, payable transaction for a small amount, so the
+    caller must explicitly confirm before it is created.
+    """
+
+    confirm: bool = Field(
+        default=False,
+        description='Must be true to create a real (low-value) test payment.',
+    )
+
+
+class PaymentTestResponse(BaseModel):
+    provider: str
+    amount_kopeks: int
+    # Identifiers for the follow-up status check (provider-specific).
+    local_payment_id: int | None = None
+    order_id: str | None = None
+    provider_payment_id: str | None = None
+    # Primary payable link plus any provider-specific alternatives.
+    payment_url: str | None = None
+    extra_urls: dict[str, str] = Field(default_factory=dict)
+    # How to check status afterwards (None if the provider exposes no checker).
+    status_check_param: str | None = None
+    notes: str | None = None
+
+
+class PaymentTestStatusResponse(BaseModel):
+    provider: str
+    status: str | None = None
+    is_paid: bool = False
+    raw: dict | None = None
+
+
+# ============ Provider test helpers ============
+
+# Providers whose test flow the bot implements via PaymentService and that we
+# can therefore mirror here. Each entry declares whether the provider is
+# enabled, the low-value test amount (kopeks), whether a Bot instance is
+# required, and the param the status checker keys off.
+_TEST_PROVIDERS: dict[str, dict[str, object]] = {
+    'yookassa': {'requires_bot': False, 'status_param': 'local_payment_id'},
+    'mulenpay': {'requires_bot': False, 'status_param': 'local_payment_id'},
+    'pal24': {'requires_bot': False, 'status_param': 'local_payment_id'},
+    'cryptobot': {'requires_bot': False, 'status_param': 'local_payment_id'},
+    'freekassa': {'requires_bot': False, 'status_param': 'local_payment_id'},
+    'kassa_ai': {'requires_bot': False, 'status_param': 'local_payment_id'},
+    'riopay': {'requires_bot': False, 'status_param': 'order_id'},
+    'stars': {'requires_bot': True, 'status_param': None},
+}
+
+
+def _provider_enabled(provider: str) -> bool:
+    checks = {
+        'yookassa': settings.is_yookassa_enabled,
+        'mulenpay': settings.is_mulenpay_enabled,
+        'pal24': settings.is_pal24_enabled,
+        'cryptobot': settings.is_cryptobot_enabled,
+        'freekassa': settings.is_freekassa_enabled,
+        'kassa_ai': settings.is_kassa_ai_enabled,
+        'riopay': settings.is_riopay_enabled,
+        'stars': lambda: bool(settings.TELEGRAM_STARS_ENABLED),
+    }
+    check = checks.get(provider)
+    return bool(check()) if check else False
+
+
+async def _create_test_payment(
+    provider: str,
+    payment_service: PaymentService,
+    db: AsyncSession,
+    admin: User,
+) -> PaymentTestResponse:
+    """Create one real low-value test payment, mirroring the bot test buttons."""
+    language = getattr(admin, 'language', None) or settings.DEFAULT_LANGUAGE
+
+    if provider == 'yookassa':
+        amount_kopeks = 10 * 100
+        result = await payment_service.create_yookassa_payment(
+            db=db,
+            user_id=admin.id,
+            amount_kopeks=amount_kopeks,
+            description='Тестовый платеж (админ, кабинет)',
+            metadata={
+                'user_telegram_id': str(getattr(admin, 'telegram_id', '') or ''),
+                'purpose': 'admin_test_payment',
+                'provider': 'yookassa',
+            },
+        )
+        if not result or not result.get('confirmation_url'):
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail='Failed to create YooKassa test payment',
+            )
+        return PaymentTestResponse(
+            provider=provider,
+            amount_kopeks=amount_kopeks,
+            local_payment_id=result.get('local_payment_id'),
+            provider_payment_id=str(result.get('yookassa_payment_id') or '') or None,
+            payment_url=result['confirmation_url'],
+            status_check_param='local_payment_id',
+        )
+
+    if provider == 'mulenpay':
+        amount_kopeks = 1 * 100
+        result = await payment_service.create_mulenpay_payment(
+            db=db,
+            user_id=admin.id,
+            amount_kopeks=amount_kopeks,
+            description='Тестовый платеж MulenPay (админ, кабинет)',
+            language=language,
+        )
+        if not result or not result.get('payment_url'):
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail='Failed to create MulenPay test payment',
+            )
+        return PaymentTestResponse(
+            provider=provider,
+            amount_kopeks=amount_kopeks,
+            local_payment_id=result.get('local_payment_id'),
+            provider_payment_id=str(result.get('mulen_payment_id') or '') or None,
+            payment_url=result['payment_url'],
+            status_check_param='local_payment_id',
+        )
+
+    if provider == 'pal24':
+        amount_kopeks = 10 * 100
+        result = await payment_service.create_pal24_payment(
+            db=db,
+            user_id=admin.id,
+            amount_kopeks=amount_kopeks,
+            description='Тестовый платеж PayPalych (админ, кабинет)',
+            language=language or 'ru',
+        )
+        if not result:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail='Failed to create PayPalych test payment',
+            )
+        sbp_url = result.get('sbp_url') or result.get('transfer_url') or result.get('link_url')
+        card_url = result.get('card_url')
+        fallback_url = result.get('link_page_url') or result.get('link_url')
+        primary = sbp_url or card_url or fallback_url
+        if not primary:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail='Failed to obtain PayPalych payment link',
+            )
+        extra: dict[str, str] = {}
+        if sbp_url:
+            extra['sbp_url'] = sbp_url
+        if card_url and card_url != sbp_url:
+            extra['card_url'] = card_url
+        if fallback_url and fallback_url not in (sbp_url, card_url):
+            extra['link_page_url'] = fallback_url
+        return PaymentTestResponse(
+            provider=provider,
+            amount_kopeks=amount_kopeks,
+            local_payment_id=result.get('local_payment_id'),
+            provider_payment_id=str(result.get('bill_id') or '') or None,
+            payment_url=primary,
+            extra_urls=extra,
+            status_check_param='local_payment_id',
+        )
+
+    if provider == 'cryptobot':
+        amount_rubles = 100.0
+        try:
+            from app.utils.currency_converter import currency_converter
+
+            current_rate = await currency_converter.get_usd_to_rub_rate()
+        except Exception as error:
+            logger.warning('Failed to fetch USD/RUB rate for test payment', error=str(error))
+            current_rate = None
+        if not current_rate or current_rate <= 0:
+            current_rate = 100.0
+        amount_usd = round(amount_rubles / current_rate, 2)
+        if amount_usd < 1:
+            amount_usd = 1.0
+        result = await payment_service.create_cryptobot_payment(
+            db=db,
+            user_id=admin.id,
+            amount_usd=amount_usd,
+            asset=settings.CRYPTOBOT_DEFAULT_ASSET,
+            description=f'Тестовый платеж CryptoBot {amount_rubles:.0f} (админ, кабинет)',
+            payload=f'admin_cryptobot_test_{admin.id}_{int(time.time())}',
+        )
+        if not result:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail='Failed to create CryptoBot test payment',
+            )
+        payment_url = (
+            result.get('bot_invoice_url')
+            or result.get('mini_app_invoice_url')
+            or result.get('web_app_invoice_url')
+        )
+        if not payment_url:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail='Failed to obtain CryptoBot payment link',
+            )
+        return PaymentTestResponse(
+            provider=provider,
+            amount_kopeks=int(amount_rubles * 100),
+            local_payment_id=result.get('local_payment_id'),
+            provider_payment_id=str(result.get('invoice_id') or '') or None,
+            payment_url=payment_url,
+            status_check_param='local_payment_id',
+            notes=f'asset={result.get("asset")}, amount_usd={amount_usd:.2f}',
+        )
+
+    if provider == 'freekassa':
+        amount_kopeks = settings.FREEKASSA_MIN_AMOUNT_KOPEKS
+        result = await payment_service.create_freekassa_payment(
+            db=db,
+            user_id=admin.id,
+            amount_kopeks=amount_kopeks,
+            description='Тестовый платеж Freekassa (админ, кабинет)',
+            email=getattr(admin, 'email', None),
+            language=language,
+        )
+        if not result or not result.get('payment_url'):
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail='Failed to create Freekassa test payment',
+            )
+        return PaymentTestResponse(
+            provider=provider,
+            amount_kopeks=amount_kopeks,
+            local_payment_id=result.get('local_payment_id'),
+            order_id=str(result.get('order_id') or '') or None,
+            payment_url=result['payment_url'],
+            status_check_param='local_payment_id',
+        )
+
+    if provider == 'kassa_ai':
+        amount_kopeks = settings.KASSA_AI_MIN_AMOUNT_KOPEKS
+        result = await payment_service.create_kassa_ai_payment(
+            db=db,
+            user_id=admin.id,
+            amount_kopeks=amount_kopeks,
+            description='Тестовый платеж Kassa AI (админ, кабинет)',
+            email=getattr(admin, 'email', None),
+            language=language,
+        )
+        if not result or not result.get('payment_url'):
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail='Failed to create Kassa AI test payment',
+            )
+        return PaymentTestResponse(
+            provider=provider,
+            amount_kopeks=amount_kopeks,
+            local_payment_id=result.get('local_payment_id'),
+            order_id=str(result.get('order_id') or '') or None,
+            payment_url=result['payment_url'],
+            status_check_param='local_payment_id',
+        )
+
+    if provider == 'riopay':
+        amount_kopeks = settings.RIOPAY_MIN_AMOUNT_KOPEKS
+        result = await payment_service.create_riopay_payment(
+            db=db,
+            user_id=admin.id,
+            amount_kopeks=amount_kopeks,
+            description='Тестовый платеж RioPay (админ, кабинет)',
+            email=getattr(admin, 'email', None),
+            language=language,
+        )
+        if not result or not result.get('payment_url'):
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail='Failed to create RioPay test payment',
+            )
+        return PaymentTestResponse(
+            provider=provider,
+            amount_kopeks=amount_kopeks,
+            local_payment_id=result.get('local_payment_id'),
+            order_id=str(result.get('order_id') or '') or None,
+            payment_url=result['payment_url'],
+            status_check_param='order_id',
+        )
+
+    if provider == 'stars':
+        stars_rate = settings.get_stars_rate()
+        amount_kopeks = max(1, int(round(stars_rate * 100)))
+        payload = f'admin_stars_test_{admin.id}_{int(time.time())}'
+        invoice_link = await payment_service.create_stars_invoice(
+            amount_kopeks=amount_kopeks,
+            description='Тестовый платеж Telegram Stars (админ, кабинет)',
+            payload=payload,
+        )
+        if not invoice_link:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail='Failed to create Telegram Stars test invoice',
+            )
+        return PaymentTestResponse(
+            provider=provider,
+            amount_kopeks=amount_kopeks,
+            payment_url=invoice_link,
+            status_check_param=None,
+            notes='Telegram Stars invoices have no server-side status checker; '
+            'verify via the bot after paying.',
+        )
+
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail=f'Unsupported test provider: {provider}',
+    )
+
+
+# ============ Provider test routes ============
+
+
+@router.post('/{provider}/test', response_model=PaymentTestResponse)
+async def create_provider_test_payment(
+    provider: str,
+    request: PaymentTestRequest,
+    admin: User = Depends(require_permission('payment_methods:edit')),
+    db: AsyncSession = Depends(get_cabinet_db),
+):
+    """Create a real low-value test payment for a provider (mirrors the bot test buttons).
+
+    This is a financial operation: it creates a genuine payable transaction, so
+    the caller must pass ``confirm=true``.
+    """
+    provider = provider.lower().strip()
+
+    if provider not in _TEST_PROVIDERS:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f'Unsupported test provider: {provider}',
+        )
+
+    if not request.confirm:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail='confirm must be true to create a real test payment',
+        )
+
+    if not _provider_enabled(provider):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f'Provider is disabled: {provider}',
+        )
+
+    logger.info(
+        'Admin creating provider test payment',
+        admin_id=admin.id,
+        provider=provider,
+    )
+
+    requires_bot = bool(_TEST_PROVIDERS[provider]['requires_bot'])
+    bot: Bot | None = None
+    try:
+        if requires_bot:
+            if not settings.BOT_TOKEN:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail='BOT_TOKEN is not configured; cannot create this test payment',
+                )
+            bot = Bot(token=settings.BOT_TOKEN)
+        payment_service = PaymentService(bot)
+        response = await _create_test_payment(provider, payment_service, db, admin)
+        logger.info(
+            'Admin created provider test payment',
+            admin_id=admin.id,
+            provider=provider,
+            local_payment_id=response.local_payment_id,
+            order_id=response.order_id,
+        )
+        return response
+    except HTTPException:
+        raise
+    except Exception as error:
+        logger.error(
+            'Failed to create provider test payment',
+            admin_id=admin.id,
+            provider=provider,
+            error=str(error),
+        )
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f'Failed to create test payment: {error}',
+        )
+    finally:
+        if bot is not None:
+            await bot.session.close()
+
+
+@router.get('/{provider}/test/status', response_model=PaymentTestStatusResponse)
+async def check_provider_test_payment_status(
+    provider: str,
+    local_payment_id: int | None = None,
+    order_id: str | None = None,
+    admin: User = Depends(require_permission('payment_methods:edit')),
+    db: AsyncSession = Depends(get_cabinet_db),
+):
+    """Check the status of a previously created provider test payment."""
+    provider = provider.lower().strip()
+
+    if provider not in _TEST_PROVIDERS:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f'Unsupported test provider: {provider}',
+        )
+
+    status_param = _TEST_PROVIDERS[provider]['status_param']
+    if status_param is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f'Provider does not support a server-side status check: {provider}',
+        )
+
+    if status_param == 'local_payment_id' and local_payment_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail='local_payment_id query parameter is required',
+        )
+    if status_param == 'order_id' and not order_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail='order_id query parameter is required',
+        )
+
+    payment_service = PaymentService(None)
+    try:
+        if provider == 'yookassa':
+            result = await payment_service.get_yookassa_payment_status(db, local_payment_id)
+        elif provider == 'mulenpay':
+            result = await payment_service.get_mulenpay_payment_status(db, local_payment_id)
+        elif provider == 'pal24':
+            result = await payment_service.get_pal24_payment_status(db, local_payment_id)
+        elif provider == 'cryptobot':
+            result = await payment_service.get_cryptobot_payment_status(db, local_payment_id)
+        elif provider == 'freekassa':
+            result = await payment_service.get_freekassa_payment_status(db, local_payment_id)
+        elif provider == 'kassa_ai':
+            result = await payment_service.get_kassa_ai_payment_status(db, local_payment_id)
+        elif provider == 'riopay':
+            result = await payment_service.check_riopay_payment_status(db, order_id)
+        else:  # pragma: no cover - guarded above
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f'Unsupported test provider: {provider}',
+            )
+    except HTTPException:
+        raise
+    except Exception as error:
+        logger.error(
+            'Failed to check provider test payment status',
+            admin_id=admin.id,
+            provider=provider,
+            error=str(error),
+        )
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f'Failed to check payment status: {error}',
+        )
+
+    if not result:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail='Test payment not found',
+        )
+
+    payment = result.get('payment') if isinstance(result, dict) else None
+    status_value = result.get('status') if isinstance(result, dict) else None
+    if status_value is None and payment is not None:
+        status_value = getattr(payment, 'status', None)
+
+    is_paid = False
+    if isinstance(result, dict) and 'is_paid' in result:
+        is_paid = bool(result.get('is_paid'))
+    elif payment is not None:
+        is_paid = bool(getattr(payment, 'is_paid', False))
+
+    return PaymentTestStatusResponse(
+        provider=provider,
+        status=status_value,
+        is_paid=is_paid,
+    )

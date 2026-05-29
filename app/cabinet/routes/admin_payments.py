@@ -93,6 +93,37 @@ class PaymentsStatsResponse(BaseModel):
     by_method: dict
 
 
+class CheckAllRequest(BaseModel):
+    """Confirmation body for bulk re-check of pending payments."""
+
+    confirm: bool = False
+
+
+class CheckAllItemResult(BaseModel):
+    """Per-invoice outcome of a bulk re-check."""
+
+    id: int
+    method: str
+    method_display: str
+    identifier: str
+    checked: bool
+    confirmed: bool
+    status_changed: bool
+    old_status: str | None = None
+    new_status: str | None = None
+    error: str | None = None
+
+
+class CheckAllResponse(BaseModel):
+    """Summary of a bulk re-check across all pending payments."""
+
+    total_checkable: int
+    checked: int
+    confirmed: int
+    failed: int
+    results: list[CheckAllItemResult]
+
+
 class SearchStatsResponse(BaseModel):
     """Statistics for payment search results."""
 
@@ -585,4 +616,127 @@ async def check_payment_status(
         status_changed=status_changed,
         old_status=old_status,
         new_status=updated.status,
+    )
+
+
+@router.post('/check-all', response_model=CheckAllResponse)
+async def check_all_pending_payments(
+    body: CheckAllRequest,
+    admin: User = Depends(require_permission('payments:edit')),
+    db: AsyncSession = Depends(get_cabinet_db),
+):
+    """Re-check every pending invoice in one call (mirrors the bot's "Check all").
+
+    Loops the same per-invoice manual check used by the single-check endpoint
+    and returns a per-invoice results summary. This is a mass operation, so an
+    explicit ``confirm`` flag is required in the request body.
+    """
+    if not body.confirm:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail='Confirmation required: set "confirm" to true to re-check all pending payments',
+        )
+
+    all_pending = await list_recent_pending_payments(db)
+    checkable = [r for r in all_pending if _is_checkable(r) and not r.is_paid]
+
+    logger.info(
+        'Admin started bulk payment check',
+        admin_id=admin.id,
+        total_pending=len(all_pending),
+        total_checkable=len(checkable),
+    )
+
+    bot = create_bot()
+    results: list[CheckAllItemResult] = []
+    checked = 0
+    confirmed = 0
+    failed = 0
+
+    try:
+        payment_service = PaymentService(bot=bot)
+        for record in checkable:
+            old_status = record.status
+            old_is_paid = record.is_paid
+            try:
+                updated = await run_manual_check(db, record.method, record.local_id, payment_service)
+            except Exception as exc:
+                failed += 1
+                logger.error(
+                    'Bulk payment check failed for invoice',
+                    admin_id=admin.id,
+                    method=record.method.value,
+                    local_id=record.local_id,
+                    error=str(exc),
+                    exc_info=True,
+                )
+                results.append(
+                    CheckAllItemResult(
+                        id=record.local_id,
+                        method=record.method.value,
+                        method_display=method_display_name(record.method),
+                        identifier=record.identifier,
+                        checked=False,
+                        confirmed=False,
+                        status_changed=False,
+                        old_status=old_status,
+                        new_status=None,
+                        error=str(exc),
+                    )
+                )
+                continue
+
+            if not updated:
+                failed += 1
+                results.append(
+                    CheckAllItemResult(
+                        id=record.local_id,
+                        method=record.method.value,
+                        method_display=method_display_name(record.method),
+                        identifier=record.identifier,
+                        checked=False,
+                        confirmed=False,
+                        status_changed=False,
+                        old_status=old_status,
+                        new_status=None,
+                        error='Не удалось проверить статус платежа',
+                    )
+                )
+                continue
+
+            checked += 1
+            newly_confirmed = bool(updated.is_paid and not old_is_paid)
+            if newly_confirmed:
+                confirmed += 1
+            status_changed = updated.status != old_status or updated.is_paid != old_is_paid
+            results.append(
+                CheckAllItemResult(
+                    id=record.local_id,
+                    method=record.method.value,
+                    method_display=method_display_name(record.method),
+                    identifier=record.identifier,
+                    checked=True,
+                    confirmed=newly_confirmed,
+                    status_changed=status_changed,
+                    old_status=old_status,
+                    new_status=updated.status,
+                )
+            )
+    finally:
+        await bot.session.close()
+
+    logger.info(
+        'Admin completed bulk payment check',
+        admin_id=admin.id,
+        checked=checked,
+        confirmed=confirmed,
+        failed=failed,
+    )
+
+    return CheckAllResponse(
+        total_checkable=len(checkable),
+        checked=checked,
+        confirmed=confirmed,
+        failed=failed,
+        results=results,
     )

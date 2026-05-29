@@ -1696,6 +1696,8 @@ class Tariff(Base):
 
     # Дополнительные настройки
     is_trial_available = Column(Boolean, default=False, nullable=False)  # Можно ли взять триал на этом тарифе
+    # Переопределение длительности триала для этого тарифа; None = глобальная настройка
+    trial_duration_days = Column(Integer, nullable=True, default=None)
     allow_traffic_topup = Column(Boolean, default=True, nullable=False)  # Разрешена ли докупка трафика для этого тарифа
 
     # Докупка трафика

@@ -5,7 +5,7 @@ from collections import defaultdict
 from datetime import UTC, datetime
 
 import structlog
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, status
 from pydantic import BaseModel
 from sqlalchemy import and_, func, literal, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -1528,4 +1528,254 @@ async def search_referral_network(
     return NetworkSearchResult(
         users=user_nodes,
         campaigns=campaign_nodes,
+    )
+
+
+# ============ Referral bonus repair (DB-driven) ============
+#
+# Mirrors the bot's "Проверить бонусы (по БД)" / "Начислить все бонусы" flow
+# (handlers/admin/referrals.py: check_missing_bonuses + apply_missing_bonuses).
+# This is the DB-driven repair path, NOT the Telegram log-upload diagnostics path.
+# It reuses the SAME service the bot uses:
+#   referral_diagnostics_service.check_missing_bonuses(db)  -> MissingBonusReport
+#   referral_diagnostics_service.fix_missing_bonuses(db, missing, apply=...) -> FixReport
+#
+# FINANCIALLY SENSITIVE: the apply step credits real balances. Because the cabinet
+# is stateless (unlike the bot's FSM-cached report), the apply step re-runs the
+# DB scan server-side and never trusts client-supplied amounts. An explicit
+# confirm flag is required for the apply step.
+
+BONUS_CHECK_RATE_LIMIT = 5
+BONUS_CHECK_RATE_WINDOW = 60
+BONUS_APPLY_RATE_LIMIT = 2
+BONUS_APPLY_RATE_WINDOW = 60
+
+MISSING_BONUS_PREVIEW_LIMIT = 100
+
+
+class MissingBonusItem(BaseModel):
+    referral_id: int
+    referral_telegram_id: int | None
+    referral_username: str | None
+    referral_full_name: str | None
+    referrer_id: int
+    referrer_telegram_id: int | None
+    referrer_username: str | None
+    referrer_full_name: str | None
+    first_topup_amount_kopeks: int
+    first_topup_date: str | None
+    missing_referral_bonus: bool
+    missing_referrer_bonus: bool
+    referral_bonus_amount_kopeks: int
+    referrer_bonus_amount_kopeks: int
+
+
+class MissingBonusCheckResponse(BaseModel):
+    total_referrals_checked: int
+    referrals_with_topup: int
+    missing_count: int
+    total_missing_to_referrals_kopeks: int
+    total_missing_to_referrers_kopeks: int
+    total_missing_kopeks: int
+    # Capped preview of the affected referral/referrer pairs.
+    missing_bonuses: list[MissingBonusItem]
+    preview_truncated: bool
+
+
+class MissingBonusApplyRequest(BaseModel):
+    # Destructive/financial confirmation gate. Must be explicitly true.
+    confirm: bool = False
+
+
+class MissingBonusApplyResponse(BaseModel):
+    applied: bool
+    users_fixed: int
+    bonuses_to_referrals_kopeks: int
+    bonuses_to_referrers_kopeks: int
+    total_credited_kopeks: int
+    errors: int
+
+
+def _missing_bonus_to_item(missing: object) -> MissingBonusItem:
+    """Map a service MissingBonus dataclass to the response schema."""
+    topup_date = getattr(missing, 'first_topup_date', None)
+    return MissingBonusItem(
+        referral_id=missing.referral_id,
+        referral_telegram_id=missing.referral_telegram_id,
+        referral_username=missing.referral_username,
+        referral_full_name=missing.referral_full_name,
+        referrer_id=missing.referrer_id,
+        referrer_telegram_id=missing.referrer_telegram_id,
+        referrer_username=missing.referrer_username,
+        referrer_full_name=missing.referrer_full_name,
+        first_topup_amount_kopeks=missing.first_topup_amount_kopeks,
+        first_topup_date=_format_datetime(topup_date),
+        missing_referral_bonus=missing.missing_referral_bonus,
+        missing_referrer_bonus=missing.missing_referrer_bonus,
+        referral_bonus_amount_kopeks=missing.referral_bonus_amount,
+        referrer_bonus_amount_kopeks=missing.referrer_bonus_amount,
+    )
+
+
+@router.get('/bonus-repair/check', response_model=MissingBonusCheckResponse)
+async def check_missing_referral_bonuses(
+    admin: User = Depends(require_permission('users:referral')),
+    db: AsyncSession = Depends(get_cabinet_db),
+) -> MissingBonusCheckResponse:
+    """Scan the DB for referrals who topped up >= the minimum but never received
+    the referral/inviter bonus, and report the totals owed.
+
+    Read-only. Mirrors the bot's admin_ref_check_bonuses handler.
+    """
+    if await RateLimitCache.is_rate_limited(
+        admin.id,
+        'referral_bonus_check',
+        BONUS_CHECK_RATE_LIMIT,
+        BONUS_CHECK_RATE_WINDOW,
+        fail_closed=True,
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail='Too many requests',
+            headers={'Retry-After': str(BONUS_CHECK_RATE_WINDOW)},
+        )
+
+    logger.info('Checking missing referral bonuses (DB scan)', admin_id=admin.id)
+
+    try:
+        from app.services.referral_diagnostics_service import referral_diagnostics_service
+
+        report = await referral_diagnostics_service.check_missing_bonuses(db)
+    except Exception as exc:
+        logger.error(
+            'Failed to check missing referral bonuses',
+            admin_id=admin.id,
+            error=str(exc),
+            exc_info=True,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail='Failed to check missing referral bonuses',
+        ) from exc
+
+    missing = report.missing_bonuses
+    preview_truncated = len(missing) > MISSING_BONUS_PREVIEW_LIMIT
+    preview = [_missing_bonus_to_item(mb) for mb in missing[:MISSING_BONUS_PREVIEW_LIMIT]]
+
+    total_missing = report.total_missing_to_referrals + report.total_missing_to_referrers
+
+    logger.info(
+        'Missing referral bonus scan complete',
+        admin_id=admin.id,
+        total_referrals_checked=report.total_referrals_checked,
+        referrals_with_topup=report.referrals_with_topup,
+        missing_count=len(missing),
+        total_missing_kopeks=total_missing,
+    )
+
+    return MissingBonusCheckResponse(
+        total_referrals_checked=report.total_referrals_checked,
+        referrals_with_topup=report.referrals_with_topup,
+        missing_count=len(missing),
+        total_missing_to_referrals_kopeks=report.total_missing_to_referrals,
+        total_missing_to_referrers_kopeks=report.total_missing_to_referrers,
+        total_missing_kopeks=total_missing,
+        missing_bonuses=preview,
+        preview_truncated=preview_truncated,
+    )
+
+
+@router.post('/bonus-repair/apply', response_model=MissingBonusApplyResponse)
+async def apply_missing_referral_bonuses(
+    payload: MissingBonusApplyRequest = Body(...),
+    admin: User = Depends(require_permission('users:referral')),
+    db: AsyncSession = Depends(get_cabinet_db),
+) -> MissingBonusApplyResponse:
+    """Bulk-credit all currently-missing referral/inviter bonuses found by a fresh
+    DB scan. Mirrors the bot's admin_ref_bonus_apply handler.
+
+    FINANCIALLY SENSITIVE: this credits real user balances and creates
+    ReferralEarning records. The set of bonuses is recomputed server-side via the
+    same service the bot uses; client-supplied amounts are never trusted. An
+    explicit ``confirm: true`` flag is required.
+    """
+    if not payload.confirm:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail='Confirmation required: set "confirm" to true to credit missing referral bonuses',
+        )
+
+    if await RateLimitCache.is_rate_limited(
+        admin.id,
+        'referral_bonus_apply',
+        BONUS_APPLY_RATE_LIMIT,
+        BONUS_APPLY_RATE_WINDOW,
+        fail_closed=True,
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail='Too many requests',
+            headers={'Retry-After': str(BONUS_APPLY_RATE_WINDOW)},
+        )
+
+    logger.warning(
+        'Applying missing referral bonuses (financial, DB-driven, all-users scope)',
+        admin_id=admin.id,
+        admin_telegram_id=admin.telegram_id,
+        scope='all_missing_referral_bonuses',
+    )
+
+    try:
+        from app.services.referral_diagnostics_service import referral_diagnostics_service
+
+        # Re-scan server-side so the amounts credited are authoritative, never
+        # taken from the client (the bot caches this in FSM; the cabinet is stateless).
+        report = await referral_diagnostics_service.check_missing_bonuses(db)
+
+        if not report.missing_bonuses:
+            logger.info('No missing referral bonuses to credit', admin_id=admin.id)
+            return MissingBonusApplyResponse(
+                applied=True,
+                users_fixed=0,
+                bonuses_to_referrals_kopeks=0,
+                bonuses_to_referrers_kopeks=0,
+                total_credited_kopeks=0,
+                errors=0,
+            )
+
+        fix_report = await referral_diagnostics_service.fix_missing_bonuses(
+            db,
+            report.missing_bonuses,
+            apply=True,
+        )
+    except Exception as exc:
+        logger.error(
+            'Failed to apply missing referral bonuses',
+            admin_id=admin.id,
+            error=str(exc),
+            exc_info=True,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail='Failed to apply missing referral bonuses',
+        ) from exc
+
+    total_credited = fix_report.bonuses_to_referrals + fix_report.bonuses_to_referrers
+
+    logger.warning(
+        'Missing referral bonuses credited',
+        admin_id=admin.id,
+        admin_telegram_id=admin.telegram_id,
+        users_fixed=fix_report.users_fixed,
+        total_credited_kopeks=total_credited,
+        errors=fix_report.errors,
+    )
+
+    return MissingBonusApplyResponse(
+        applied=True,
+        users_fixed=fix_report.users_fixed,
+        bonuses_to_referrals_kopeks=fix_report.bonuses_to_referrals,
+        bonuses_to_referrers_kopeks=fix_report.bonuses_to_referrers,
+        total_credited_kopeks=total_credited,
+        errors=fix_report.errors,
     )

@@ -273,6 +273,8 @@ async def get_tariff(
         external_squad_uuid=tariff.external_squad_uuid,
         # Показывать в подарках
         show_in_gift=tariff.show_in_gift,
+        # Переопределение длительности триала (None = глобальная настройка)
+        trial_duration_days=getattr(tariff, 'trial_duration_days', None),
         created_at=tariff.created_at,
         updated_at=tariff.updated_at,
     )
@@ -332,6 +334,13 @@ async def create_new_tariff(
         # Показывать в подарках
         show_in_gift=request.show_in_gift,
     )
+
+    # Переопределение длительности триала (CRUD create_tariff его не принимает —
+    # ставим напрямую на модель, как это делает бот через update_tariff)
+    if request.trial_duration_days is not None:
+        tariff.trial_duration_days = request.trial_duration_days
+        await db.commit()
+        await db.refresh(tariff)
 
     logger.info('Admin created tariff', admin_id=admin.id, tariff_id=tariff.id, tariff_name=tariff.name)
 
@@ -433,6 +442,16 @@ async def update_existing_tariff(
 
     if updates:
         await update_tariff(db, tariff, **updates)
+
+    # Переопределение длительности триала (CRUD update_tariff его не принимает —
+    # ставим напрямую на модель, как это делает бот). 0/None = сброс к глобальной
+    # настройке TRIAL_DURATION_DAYS; в этом случае пишем None.
+    if 'trial_duration_days' in request.model_fields_set:
+        new_trial_days = request.trial_duration_days or None
+        if getattr(tariff, 'trial_duration_days', None) != new_trial_days:
+            tariff.trial_duration_days = new_trial_days
+            await db.commit()
+            await db.refresh(tariff)
 
     # Update promo groups separately
     if request.promo_group_ids is not None:

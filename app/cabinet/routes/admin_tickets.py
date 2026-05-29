@@ -1,7 +1,7 @@
 """Admin tickets routes for cabinet."""
 
 import math
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -640,3 +640,373 @@ async def update_ticket_priority(
         user=user_info,
         messages=messages_response,
     )
+
+
+# ---------------------------------------------------------------------------
+# Per-ticket reply-block (mirrors app/handlers/admin/tickets.py block flows)
+# ---------------------------------------------------------------------------
+
+
+class TicketReplyBlockResponse(BaseModel):
+    """Current reply-block state of a ticket."""
+
+    ticket_id: int
+    is_reply_blocked: bool
+    block_permanent: bool
+    block_until: datetime | None = None
+
+
+class TicketReplyBlockRequest(BaseModel):
+    """Block a user from replying to a ticket.
+
+    Provide ``minutes`` for a timed block (1..525600 = 1 year), or set
+    ``permanent=true`` (with ``confirm=true``) for an indefinite block.
+    """
+
+    minutes: int | None = Field(
+        None, ge=1, le=60 * 24 * 365, description='Timed block duration in minutes (1..525600)'
+    )
+    permanent: bool = Field(False, description='Block the user permanently for this ticket')
+    confirm: bool = Field(False, description='Must be true to apply a permanent block')
+
+    @model_validator(mode='after')
+    def validate_block(self) -> 'TicketReplyBlockRequest':
+        if self.permanent:
+            if self.minutes is not None:
+                raise ValueError('minutes must be omitted for a permanent block')
+        elif self.minutes is None:
+            raise ValueError('minutes is required for a timed block (or set permanent=true)')
+        return self
+
+
+def _ticket_block_response(ticket: Ticket) -> TicketReplyBlockResponse:
+    """Build the reply-block state response for a ticket."""
+    return TicketReplyBlockResponse(
+        ticket_id=ticket.id,
+        is_reply_blocked=getattr(ticket, 'is_user_reply_blocked', False),
+        block_permanent=bool(getattr(ticket, 'user_reply_block_permanent', False)),
+        block_until=getattr(ticket, 'user_reply_block_until', None),
+    )
+
+
+@router.post('/{ticket_id}/reply-block', response_model=TicketReplyBlockResponse)
+async def set_ticket_reply_block(
+    ticket_id: int,
+    request: TicketReplyBlockRequest,
+    admin: User = Depends(require_permission('tickets:reply')),
+    db: AsyncSession = Depends(get_cabinet_db),
+):
+    """Block a user from replying to this ticket (timed or permanent).
+
+    Mirrors the bot's block flows. A permanent block is a sensitive action and
+    requires ``confirm=true``; the admin id and scope are logged to the support
+    audit trail.
+    """
+    if request.permanent and not request.confirm:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail='Permanent block requires confirm=true',
+        )
+
+    try:
+        ticket = await TicketCRUD.get_ticket_by_id(db, ticket_id, load_messages=False, load_user=True)
+        if not ticket:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail='Ticket not found',
+            )
+
+        if request.permanent:
+            until = None
+            action = 'block_user_perm'
+            audit_details: dict = {
+                'target_telegram_id': ticket.user.telegram_id if ticket.user else None,
+                'target_username': ticket.user.username if ticket.user else None,
+            }
+        else:
+            until = datetime.now(UTC) + timedelta(minutes=request.minutes)
+            action = 'block_user_timed'
+            audit_details = {'minutes': request.minutes}
+
+        ok = await TicketCRUD.set_user_reply_block(
+            db, ticket_id, permanent=request.permanent, until=until
+        )
+        if not ok:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail='Failed to apply reply block',
+            )
+
+        logger.info(
+            'Admin set ticket reply block',
+            admin_id=admin.id,
+            ticket_id=ticket_id,
+            target_user_id=ticket.user_id,
+            permanent=request.permanent,
+            minutes=request.minutes,
+        )
+
+        try:
+            await TicketCRUD.add_support_audit(
+                db,
+                actor_user_id=admin.id,
+                actor_telegram_id=admin.telegram_id or 0,
+                is_moderator=False,
+                action=action,
+                ticket_id=ticket_id,
+                target_user_id=ticket.user_id,
+                details=audit_details,
+            )
+        except Exception as exc:
+            logger.warning('Failed to write support audit for reply block', error=exc)
+
+        refreshed = await TicketCRUD.get_ticket_by_id(db, ticket_id, load_messages=False, load_user=False)
+        return _ticket_block_response(refreshed or ticket)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error('Failed to set ticket reply block', ticket_id=ticket_id, error=str(exc))
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail='Failed to set ticket reply block',
+        )
+
+
+@router.delete('/{ticket_id}/reply-block', response_model=TicketReplyBlockResponse)
+async def clear_ticket_reply_block(
+    ticket_id: int,
+    admin: User = Depends(require_permission('tickets:reply')),
+    db: AsyncSession = Depends(get_cabinet_db),
+):
+    """Unblock a user so they can reply to this ticket again.
+
+    Mirrors the bot's unblock flow and logs the action to the support audit
+    trail.
+    """
+    try:
+        ticket = await TicketCRUD.get_ticket_by_id(db, ticket_id, load_messages=False, load_user=True)
+        if not ticket:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail='Ticket not found',
+            )
+
+        ok = await TicketCRUD.set_user_reply_block(db, ticket_id, permanent=False, until=None)
+        if not ok:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail='Failed to clear reply block',
+            )
+
+        logger.info(
+            'Admin cleared ticket reply block',
+            admin_id=admin.id,
+            ticket_id=ticket_id,
+            target_user_id=ticket.user_id,
+        )
+
+        try:
+            await TicketCRUD.add_support_audit(
+                db,
+                actor_user_id=admin.id,
+                actor_telegram_id=admin.telegram_id or 0,
+                is_moderator=False,
+                action='unblock_user',
+                ticket_id=ticket_id,
+                target_user_id=ticket.user_id,
+                details={
+                    'target_telegram_id': ticket.user.telegram_id if ticket.user else None,
+                    'target_username': ticket.user.username if ticket.user else None,
+                },
+            )
+        except Exception as exc:
+            logger.warning('Failed to write support audit for unblock', error=exc)
+
+        refreshed = await TicketCRUD.get_ticket_by_id(db, ticket_id, load_messages=False, load_user=False)
+        return _ticket_block_response(refreshed or ticket)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error('Failed to clear ticket reply block', ticket_id=ticket_id, error=str(exc))
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail='Failed to clear ticket reply block',
+        )
+
+
+# ---------------------------------------------------------------------------
+# Support description text (per-language) — SupportSettingsService.*_info_text
+# ---------------------------------------------------------------------------
+
+
+class SupportInfoTextResponse(BaseModel):
+    """Support description text for a language."""
+
+    language: str
+    text: str
+
+
+class SupportInfoTextUpdateRequest(BaseModel):
+    """Update the support description text for a language."""
+
+    text: str = Field(..., max_length=8000, description='Support description (HTML allowed)')
+
+
+@router.get('/support/info/{language}', response_model=SupportInfoTextResponse)
+async def get_support_info_text(
+    language: str,
+    admin: User = Depends(require_permission('tickets:settings')),
+    db: AsyncSession = Depends(get_cabinet_db),
+):
+    """Get the support description text for a language (falls back to default)."""
+    try:
+        from app.services.support_settings_service import SupportSettingsService
+
+        lang = language.strip().lower()
+        if not lang:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail='language is required',
+            )
+
+        text = SupportSettingsService.get_support_info_text(lang)
+        return SupportInfoTextResponse(language=lang, text=text)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error('Failed to get support info text', language=language, error=str(exc))
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail='Failed to get support info text',
+        )
+
+
+@router.put('/support/info/{language}', response_model=SupportInfoTextResponse)
+async def update_support_info_text(
+    language: str,
+    request: SupportInfoTextUpdateRequest,
+    admin: User = Depends(require_permission('tickets:settings')),
+    db: AsyncSession = Depends(get_cabinet_db),
+):
+    """Set the support description text for a language."""
+    try:
+        from app.services.support_settings_service import SupportSettingsService
+
+        lang = language.strip().lower()
+        if not lang:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail='language is required',
+            )
+
+        ok = SupportSettingsService.set_support_info_text(lang, request.text)
+        if not ok:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail='Failed to persist support info text',
+            )
+
+        logger.info('Admin updated support info text', admin_id=admin.id, language=lang)
+        text = SupportSettingsService.get_support_info_text(lang)
+        return SupportInfoTextResponse(language=lang, text=text)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error('Failed to update support info text', language=language, error=str(exc))
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail='Failed to update support info text',
+        )
+
+
+# ---------------------------------------------------------------------------
+# Support moderators (by Telegram ID) — SupportSettingsService.*_moderator
+# ---------------------------------------------------------------------------
+
+
+class SupportModeratorsResponse(BaseModel):
+    """List of support moderator Telegram IDs."""
+
+    moderators: list[int]
+
+
+class SupportModeratorRequest(BaseModel):
+    """Add or remove a support moderator by Telegram ID."""
+
+    telegram_id: int = Field(..., gt=0, description='Telegram ID of the moderator')
+
+
+@router.get('/support/moderators', response_model=SupportModeratorsResponse)
+async def list_support_moderators(
+    admin: User = Depends(require_permission('tickets:settings')),
+    db: AsyncSession = Depends(get_cabinet_db),
+):
+    """List support moderator Telegram IDs."""
+    try:
+        from app.services.support_settings_service import SupportSettingsService
+
+        return SupportModeratorsResponse(moderators=SupportSettingsService.get_moderators())
+    except Exception as exc:
+        logger.error('Failed to list support moderators', error=str(exc))
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail='Failed to list support moderators',
+        )
+
+
+@router.post('/support/moderators', response_model=SupportModeratorsResponse)
+async def add_support_moderator(
+    request: SupportModeratorRequest,
+    admin: User = Depends(require_permission('tickets:settings')),
+    db: AsyncSession = Depends(get_cabinet_db),
+):
+    """Assign a support moderator by Telegram ID."""
+    try:
+        from app.services.support_settings_service import SupportSettingsService
+
+        ok = SupportSettingsService.add_moderator(request.telegram_id)
+        if not ok:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail='Failed to add moderator (invalid Telegram ID or persistence error)',
+            )
+
+        logger.info('Admin added support moderator', admin_id=admin.id, telegram_id=request.telegram_id)
+        return SupportModeratorsResponse(moderators=SupportSettingsService.get_moderators())
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error('Failed to add support moderator', telegram_id=request.telegram_id, error=str(exc))
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail='Failed to add support moderator',
+        )
+
+
+@router.delete('/support/moderators/{telegram_id}', response_model=SupportModeratorsResponse)
+async def remove_support_moderator(
+    telegram_id: int,
+    admin: User = Depends(require_permission('tickets:settings')),
+    db: AsyncSession = Depends(get_cabinet_db),
+):
+    """Remove a support moderator by Telegram ID."""
+    try:
+        from app.services.support_settings_service import SupportSettingsService
+
+        ok = SupportSettingsService.remove_moderator(telegram_id)
+        if not ok:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail='Failed to remove moderator (invalid Telegram ID or persistence error)',
+            )
+
+        logger.info('Admin removed support moderator', admin_id=admin.id, telegram_id=telegram_id)
+        return SupportModeratorsResponse(moderators=SupportSettingsService.get_moderators())
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error('Failed to remove support moderator', telegram_id=telegram_id, error=str(exc))
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail='Failed to remove support moderator',
+        )
